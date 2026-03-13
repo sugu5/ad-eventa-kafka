@@ -1,7 +1,7 @@
 import traceback
 from kafka import KafkaProducer
 from .logger import get_logger
-from metrics.metrics import events_sent, events_failed, producer_offset
+from metrics.producer_metrics import events_sent, events_failed, producer_offset
 
 logger = get_logger("producer")
 

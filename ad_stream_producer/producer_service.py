@@ -6,7 +6,7 @@ from confluent_kafka.serialization import SerializationContext, MessageField
 from .kafka_producer import AdKafkaProducer
 from .logger import get_logger
 from data_generator.event_generator import EventGenerator
-from metrics.metrics import events_per_second, producer_latency
+from metrics.producer_metrics import events_per_second, producer_latency
 
 logger = get_logger("producer_service")
 

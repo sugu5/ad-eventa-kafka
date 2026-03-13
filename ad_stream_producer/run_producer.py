@@ -10,8 +10,9 @@ from datetime import datetime
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from ad_stream_producer import ProducerService, metrics
+from ad_stream_producer import ProducerService
 from ad_stream_producer import Config
+from metrics.producer_metrics import start_metrics_server
 from confluent_kafka.schema_registry import SchemaRegistryClient
 from confluent_kafka.schema_registry.avro import AvroSerializer
 SCHEMA_PATH = PROJECT_ROOT / "schema" / Config.SCHEMA_PATH
@@ -96,7 +97,7 @@ def main():
         avro_serializer = get_schema_registry_client()
 
         logger.info("Starting metrics server...")
-        metrics.start_metrics_server(port=8001)
+        start_metrics_server(port=8001)
 
         # Get configuration
         topic = Config.TOPIC

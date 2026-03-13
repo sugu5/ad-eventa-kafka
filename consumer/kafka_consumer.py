@@ -11,7 +11,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from kafka import KafkaConsumer, TopicPartition
 from ad_stream_producer import Config
-from metrics.metrics import consumer_offset, consumer_lag, start_metrics_server
+from metrics.consumer_metrics import consumer_offset, consumer_lag, start_metrics_server
 
 # Configure logging
 logging.basicConfig(
