@@ -1,0 +1,15 @@
+# Kafka
+kafka-python==2.0.2
+confluent-kafka
+# Schema / Serialization
+fastavro==1.9.4
+pydantic==2.6.4
+# Data Generation
+Faker==24.2.0
+# Metrics
+prometheus-client==0.20.0
+# Spark (Consumer)
+pyspark==3.5.3
+# HTTP
+requests==2.31.0
+
