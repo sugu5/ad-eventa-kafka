@@ -2,7 +2,6 @@ services:
 
   zookeeper:
     image: confluentinc/cp-zookeeper
-    container_name: zookeeper
     restart: unless-stopped
     ports:
       - "2181:2181"
@@ -22,7 +21,6 @@ services:
 
   kafka1:
     image: confluentinc/cp-kafka:7.6.0
-    container_name: kafka1
     restart: unless-stopped
     depends_on:
       zookeeper:
@@ -58,7 +56,6 @@ services:
 
   kafka2:
     image: confluentinc/cp-kafka:7.6.0
-    container_name: kafka2
     restart: unless-stopped
     depends_on:
       zookeeper:
@@ -93,7 +90,6 @@ services:
 
   kafka3:
     image: confluentinc/cp-kafka:7.6.0
-    container_name: kafka3
     restart: unless-stopped
     depends_on:
       zookeeper:
@@ -128,7 +124,6 @@ services:
 
   schema-registry:
     image: confluentinc/cp-schema-registry:7.6.0
-    container_name: schema-registry
     restart: unless-stopped
     depends_on:
       kafka1:
@@ -152,7 +147,6 @@ services:
 
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
-    container_name: kafka-ui
     restart: unless-stopped
     depends_on:
       kafka1:
@@ -173,7 +167,6 @@ services:
 
   postgres:
     image: postgres:16-alpine
-    container_name: postgres
     restart: unless-stopped
     ports:
       - "5432:5432"

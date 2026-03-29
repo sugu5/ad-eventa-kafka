@@ -5,7 +5,6 @@ Usage:
     python -m consumer.run_consumer
 """
 import sys
-import logging
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -32,25 +31,73 @@ LOCAL_SCHEMA_PATH = PROJECT_ROOT / "schema" / Config.SCHEMA_PATH
 
 def create_spark_session():
     """Build and return a SparkSession configured for Kafka + PostgreSQL."""
+    import pyspark
     from pyspark.sql import SparkSession
+    import urllib.request
+    from pathlib import Path
+    import logging
+    
+    # Suppress known Kafka warnings
+    logging.getLogger("org.apache.kafka").setLevel(logging.ERROR)
+    logging.getLogger("kafka").setLevel(logging.ERROR)
+    
+    # Path to log4j.properties
+    log4j_path = Path(__file__).resolve().parent.parent / "log4j.properties"
+    
+    # Create a jars directory if it doesn't exist
+    jars_dir = Path(__file__).resolve().parent.parent / "jars"
+    jars_dir.mkdir(exist_ok=True)
+    
+    # Download kafka-clients JAR if not present
+    kafka_jar_path = jars_dir / "kafka-clients-3.4.1.jar"
+    if not kafka_jar_path.exists():
+        logger.info("Downloading kafka-clients JAR...")
+        url = "https://repo1.maven.org/maven2/org/apache/kafka/kafka-clients/3.4.1/kafka-clients-3.4.1.jar"
+        try:
+            urllib.request.urlretrieve(url, kafka_jar_path)
+            logger.info(f"✓ Downloaded kafka-clients JAR to {kafka_jar_path}")
+        except Exception as e:
+            logger.warning(f"Failed to download kafka-clients: {e}")
+    
+    # Download postgresql JAR if not present
+    pg_jar_path = jars_dir / "postgresql-42.6.0.jar"
+    if not pg_jar_path.exists():
+        logger.info("Downloading postgresql JAR...")
+        url = "https://repo1.maven.org/maven2/org/postgresql/postgresql/42.6.0/postgresql-42.6.0.jar"
+        try:
+            urllib.request.urlretrieve(url, pg_jar_path)
+            logger.info(f"✓ Downloaded postgresql JAR to {pg_jar_path}")
+        except Exception as e:
+            logger.warning(f"Failed to download postgresql: {e}")
+    
+    # Build jars string
+    jars = f"{kafka_jar_path},{pg_jar_path}"
 
-    spark = (
+    spark_version = pyspark.__version__
+    kafka_packages = ",".join(
+        [
+            f"org.apache.spark:spark-sql-kafka-0-10_2.12:{spark_version}",
+        ]
+    )
+
+    builder = (
         SparkSession.builder
         .appName("KafkaAdStreamConsumer")
-        .config(
-            "spark.jars.packages",
-            "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,"
-            "org.postgresql:postgresql:42.6.0",
-        )
+        .config("spark.jars.packages", kafka_packages)
+        .config("spark.jars", jars)
         .config("spark.driver.host", "127.0.0.1")
         .config("spark.streaming.kafka.consumer.cache.enabled", "false")
         .config(
             "spark.sql.streaming.forceDeleteTempCheckpointLocation", "true"
         )
-        .getOrCreate()
+        .config("spark.driver.extraJavaOptions", f"-Xss4m -Dlog4j.logger.org.apache.kafka=ERROR -Dlog4j.logger.org.apache.kafka.common.network.KafkaDataConsumer=ERROR")
+        .config("spark.executor.extraJavaOptions", "-Xss4m")
     )
+
+    spark = builder.getOrCreate()
     spark.sparkContext.setLogLevel("ERROR")
     logger.info(f"✓ Spark {spark.version} session created")
+    return spark
     return spark
 
 
@@ -115,4 +162,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
