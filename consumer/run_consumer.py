@@ -57,7 +57,6 @@ def create_spark_session():
         .config("spark.jars.packages", packages)
         .config("spark.driver.host", "127.0.0.1")
         .config("spark.streaming.kafka.consumer.cache.enabled", "false")
-        .config("spark.sql.streaming.forceDeleteTempCheckpointLocation", "true")
         .config("spark.driver.extraJavaOptions", "-Xss4m -Dlog4j.logger.org.apache.kafka=ERROR -Dlog4j.logger.org.apache.kafka.common.network.KafkaDataConsumer=ERROR")
         .config("spark.executor.extraJavaOptions", "-Xss4m")
     )
