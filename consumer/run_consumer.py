@@ -15,7 +15,10 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from ad_stream_producer.config import Config
 from ad_stream_producer.logger import get_logger
-from consumer.avro_deserializer import load_avro_schema, make_deserialize_udf
+from consumer.avro_deserializer import (
+    load_avro_schema,
+    make_from_avro_column,
+)
 from consumer.sink import make_process_batch
 
 logger = get_logger("consumer")
@@ -33,71 +36,35 @@ def create_spark_session():
     """Build and return a SparkSession configured for Kafka + PostgreSQL."""
     import pyspark
     from pyspark.sql import SparkSession
-    import urllib.request
-    from pathlib import Path
     import logging
     
     # Suppress known Kafka warnings
     logging.getLogger("org.apache.kafka").setLevel(logging.ERROR)
     logging.getLogger("kafka").setLevel(logging.ERROR)
     
-    # Path to log4j.properties
-    log4j_path = Path(__file__).resolve().parent.parent / "log4j.properties"
-    
-    # Create a jars directory if it doesn't exist
-    jars_dir = Path(__file__).resolve().parent.parent / "jars"
-    jars_dir.mkdir(exist_ok=True)
-    
-    # Download kafka-clients JAR if not present
-    kafka_jar_path = jars_dir / "kafka-clients-3.4.1.jar"
-    if not kafka_jar_path.exists():
-        logger.info("Downloading kafka-clients JAR...")
-        url = "https://repo1.maven.org/maven2/org/apache/kafka/kafka-clients/3.4.1/kafka-clients-3.4.1.jar"
-        try:
-            urllib.request.urlretrieve(url, kafka_jar_path)
-            logger.info(f"✓ Downloaded kafka-clients JAR to {kafka_jar_path}")
-        except Exception as e:
-            logger.warning(f"Failed to download kafka-clients: {e}")
-    
-    # Download postgresql JAR if not present
-    pg_jar_path = jars_dir / "postgresql-42.6.0.jar"
-    if not pg_jar_path.exists():
-        logger.info("Downloading postgresql JAR...")
-        url = "https://repo1.maven.org/maven2/org/postgresql/postgresql/42.6.0/postgresql-42.6.0.jar"
-        try:
-            urllib.request.urlretrieve(url, pg_jar_path)
-            logger.info(f"✓ Downloaded postgresql JAR to {pg_jar_path}")
-        except Exception as e:
-            logger.warning(f"Failed to download postgresql: {e}")
-    
-    # Build jars string
-    jars = f"{kafka_jar_path},{pg_jar_path}"
-
+    # Use Spark's package mechanism to fetch Kafka and PostgreSQL connectors.
+    # This avoids manual JAR downloads and is the recommended production approach.
     spark_version = pyspark.__version__
-    kafka_packages = ",".join(
-        [
-            f"org.apache.spark:spark-sql-kafka-0-10_2.12:{spark_version}",
-        ]
-    )
+    packages = ",".join([
+        f"org.apache.spark:spark-sql-kafka-0-10_2.12:{spark_version}",
+        f"org.apache.spark:spark-avro_2.12:{spark_version}",
+        "org.postgresql:postgresql:42.6.0",
+    ])
 
     builder = (
         SparkSession.builder
         .appName("KafkaAdStreamConsumer")
-        .config("spark.jars.packages", kafka_packages)
-        .config("spark.jars", jars)
+        .config("spark.jars.packages", packages)
         .config("spark.driver.host", "127.0.0.1")
         .config("spark.streaming.kafka.consumer.cache.enabled", "false")
-        .config(
-            "spark.sql.streaming.forceDeleteTempCheckpointLocation", "true"
-        )
-        .config("spark.driver.extraJavaOptions", f"-Xss4m -Dlog4j.logger.org.apache.kafka=ERROR -Dlog4j.logger.org.apache.kafka.common.network.KafkaDataConsumer=ERROR")
+        .config("spark.sql.streaming.forceDeleteTempCheckpointLocation", "true")
+        .config("spark.driver.extraJavaOptions", "-Xss4m -Dlog4j.logger.org.apache.kafka=ERROR -Dlog4j.logger.org.apache.kafka.common.network.KafkaDataConsumer=ERROR")
         .config("spark.executor.extraJavaOptions", "-Xss4m")
     )
 
     spark = builder.getOrCreate()
     spark.sparkContext.setLogLevel("ERROR")
     logger.info(f"✓ Spark {spark.version} session created")
-    return spark
     return spark
 
 
@@ -114,8 +81,15 @@ def main():
         Config.SCHEMA_REGISTRY_URL, Config.TOPIC, LOCAL_SCHEMA_PATH
     )
     logger.info(f"✓ Loaded Avro schema from {source}")
-    schema_broadcast = spark.sparkContext.broadcast(avro_schema)
-    deserialize_udf = make_deserialize_udf(schema_broadcast)
+
+    # Use Spark-native Avro deserialization that strips Confluent header
+    spark_deser = make_from_avro_column(avro_schema)
+    if spark_deser is None:
+        raise RuntimeError(
+            "Spark Avro support not available; install the spark-avro package"
+        )
+    logger.info("Using Spark-native Avro deserializer (from_avro)")
+    deserialize_udf = spark_deser
 
     # ---- Kafka source ----------------------------------------------------
     bootstrap_csv = ",".join(Config.KAFKA_BOOTSTRAP_SERVERS)
