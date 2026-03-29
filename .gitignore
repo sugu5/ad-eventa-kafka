@@ -32,4 +32,5 @@ output/
 .DS_Store
 Thumbs.db
 
-
+# Old/unused directories
+kafka_learnings/
