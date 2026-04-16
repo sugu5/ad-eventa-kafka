@@ -1,0 +1,102 @@
+WINDOWING VS NO WINDOWING
+========================
+
+## CURRENT APPROACH (No Windowing)
+
+```
+Kafka → sink.py → PostgreSQL + Late Events Parquet
+```
+
+- NO watermark needed
+- Manual lateness check in sink.py
+- All records processed individually
+- Late events: captured and stored
+- Memory usage: minimal
+
+Use when: You want individual record processing with late event capture.
+
+
+## WITH WINDOWING (Time-based Aggregations)
+
+```
+Kafka → .withWatermark() → .groupBy().window() → aggregation results
+                ↓
+         + sink.py (captures late events after grace period)
+```
+
+- MUST use watermark
+- Watermark = grace period + state cleanup
+- Aggregates records into time windows
+- Late events within grace: update results
+- Late events after grace: sink.py captures them
+- Memory usage: controlled by watermark
+
+Use when: You need counts/sums/averages per time window.
+
+
+## COMPARISON TABLE
+
+| Aspect | No Windowing | With Windowing |
+|--------|--------------|-----------------|
+| Watermark | ❌ Not needed | ✅ Required |
+| Processing | Individual records | Aggregated per window |
+| Late events | All captured in Parquet | Grace period + Parquet |
+| State management | N/A | Handled by watermark |
+| Memory | Minimal | Controlled by grace period |
+| Aggregations | Manual | Automatic |
+| Example | Current production setup | Analytics/dashboards |
+
+
+## STATE MANAGEMENT IN WINDOWING
+
+WITHOUT watermark:
+- State accumulates forever in memory
+- Memory bloat → OOM crash
+- ❌ Dangerous for production
+
+WITH watermark:
+- State cleaned after grace period
+- Memory bounded and predictable
+- ✅ Safe for production aggregations
+
+
+## WHEN TO USE WATERMARK
+
+Add watermark if you do:
+- window().groupBy().count()
+- window().groupBy().sum()
+- window().groupBy().avg()
+- Any aggregation operation
+
+Don't add watermark if you just:
+- Filter and write records
+- Transform individual records
+- Current setup: record → sink → DB
+
+
+## LATE EVENT FLOW WITH WINDOWING
+
+Scenario: Event 2 hours 30 minutes late
+
+1. Event generated at 10:00 AM
+2. Received at 1:30 PM (2.5 hours late)
+3. Window: 10:00-10:05 AM (already finalized at 10:05)
+4. Grace period: until 12:05 PM (10:05 + 2 hours)
+5. Result: Event AFTER 12:05 PM → Dropped by Spark
+6. sink.py detects it → Stores to late_events_parquet/ ✅
+
+
+## IMPLEMENTATION CHECKLIST
+
+Current (No Windowing):
+✅ Kafka → df
+✅ No watermark
+✅ sink.py: manual lateness check
+✅ Late events → Parquet
+
+If Adding Windowing Later:
+1. Add .withWatermark("event_time", "2 hours")
+2. Add .groupBy(window(col("event_time"), "5 minutes"))
+3. Add .agg(count("*"))
+4. Keep sink.py as backup for extreme late events
+

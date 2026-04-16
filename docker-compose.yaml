@@ -2,7 +2,6 @@ services:
 
   zookeeper:
     image: confluentinc/cp-zookeeper
-    container_name: zookeeper
     restart: unless-stopped
     ports:
       - "2181:2181"
@@ -22,7 +21,6 @@ services:
 
   kafka1:
     image: confluentinc/cp-kafka:7.6.0
-    container_name: kafka1
     restart: unless-stopped
     depends_on:
       zookeeper:
@@ -58,7 +56,6 @@ services:
 
   kafka2:
     image: confluentinc/cp-kafka:7.6.0
-    container_name: kafka2
     restart: unless-stopped
     depends_on:
       zookeeper:
@@ -93,7 +90,6 @@ services:
 
   kafka3:
     image: confluentinc/cp-kafka:7.6.0
-    container_name: kafka3
     restart: unless-stopped
     depends_on:
       zookeeper:
@@ -128,7 +124,6 @@ services:
 
   schema-registry:
     image: confluentinc/cp-schema-registry:7.6.0
-    container_name: schema-registry
     restart: unless-stopped
     depends_on:
       kafka1:
@@ -152,7 +147,6 @@ services:
 
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
-    container_name: kafka-ui
     restart: unless-stopped
     depends_on:
       kafka1:
@@ -173,7 +167,6 @@ services:
 
   postgres:
     image: postgres:16-alpine
-    container_name: postgres
     restart: unless-stopped
     ports:
       - "5432:5432"
@@ -191,6 +184,72 @@ services:
       retries: 5
       start_period: 10s
 
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:latest
+    restart: unless-stopped
+    depends_on:
+      kafka1:
+        condition: service_healthy
+      kafka2:
+        condition: service_healthy
+      kafka3:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKERS: kafka1:29092,kafka2:29092,kafka3:29092
+      KAFKA_VERSION: 2.8.0
+    ports:
+      - "9308:9308"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9308/metrics"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  prometheus:
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+    ports:
+      - "9090:9090"
+    depends_on:
+      - kafka-exporter
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9090/-/healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  grafana:
+    image: grafana/grafana:latest
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana-dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana-dashboards-provision.yml:/etc/grafana/provisioning/dashboards/dashboards.yml
+      - ./monitoring/grafana-datasources.yml:/etc/grafana/provisioning/datasources/grafana-datasources.yml
+    depends_on:
+      - prometheus
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
 volumes:
   zookeeper_data:
   zookeeper_log:
@@ -198,3 +257,5 @@ volumes:
   kafka2_data:
   kafka3_data:
   postgres_data:
+  prometheus_data:
+  grafana_data:
