@@ -1,5 +1,5 @@
 """
-SIMPLIFIED Kafka → PySpark Structured Streaming → PostgreSQL Consumer
+SIMPLIFIED Kafka -> PySpark Structured Streaming -> PostgreSQL Consumer
 Single file - Events + Windowed Aggregation (5-min windows)
 
 Usage:
@@ -99,7 +99,7 @@ def create_spark_session():
     )
     
     spark.sparkContext.setLogLevel("ERROR")
-    logger.info(f"✓ Spark {spark.version} session created")
+    logger.info(f"Spark {spark.version} session created")
     return spark
 
 
@@ -217,10 +217,10 @@ def process_events_batch(batch_df, epoch_id, deserialize_udf):
                         cursor.execute(f"DROP TABLE IF EXISTS {temp_table}")
                     conn.close()
                     
-                    logger.info(f"[BATCH {epoch_id}] ✓ Wrote {rows} on-time records to PostgreSQL")
+                    logger.info(f"[BATCH {epoch_id}] Wrote {rows} on-time records to PostgreSQL")
                 
                 except Exception as e:
-                    logger.error(f"[BATCH {epoch_id}] ✗ PostgreSQL failed: {e}")
+                    logger.error(f"[BATCH {epoch_id}] PostgreSQL failed: {e}")
                     logger.error(traceback.format_exc())
             
             # Write late to Parquet
@@ -233,9 +233,9 @@ def process_events_batch(batch_df, epoch_id, deserialize_udf):
                         .withColumn("ad_id", col("ad_id").cast(IntegerType()))
                     )
                     late_formatted.repartition(1).write.mode("append").parquet(LATE_EVENTS_PATH)
-                    logger.info(f"[BATCH {epoch_id}] ✓ Wrote {late_count} late records to Parquet")
+                    logger.info(f"[BATCH {epoch_id}] Wrote {late_count} late records to Parquet")
                 except Exception as e:
-                    logger.error(f"[BATCH {epoch_id}] ✗ Late events failed: {e}")
+                    logger.error(f"[BATCH {epoch_id}] Late events failed: {e}")
         
         # Write bad records
         if bad_count > 0:
@@ -243,15 +243,15 @@ def process_events_batch(batch_df, epoch_id, deserialize_udf):
                 bad_records.repartition(1).write.mode("append").format("json").save(
                     CORRUPTED_RECORDS_PATH
                 )
-                logger.info(f"[BATCH {epoch_id}] ✓ Wrote {bad_count} corrupted records")
+                logger.info(f"[BATCH {epoch_id}] Wrote {bad_count} corrupted records")
             except Exception as e:
-                logger.error(f"[BATCH {epoch_id}] ✗ Corrupted records failed: {e}")
+                logger.error(f"[BATCH {epoch_id}] Corrupted records failed: {e}")
         
         duration = (datetime.now() - batch_start).total_seconds()
-        logger.info(f"[BATCH {epoch_id}] ✓ Done in {duration:.2f}s")
+        logger.info(f"[BATCH {epoch_id}] Done in {duration:.2f}s")
     
     except Exception as e:
-        logger.error(f"[BATCH {epoch_id}] ✗ Batch processing failed: {e}")
+        logger.error(f"[BATCH {epoch_id}] Batch processing failed: {e}")
         logger.error(traceback.format_exc())
 
 
@@ -333,126 +333,182 @@ def write_aggregation_batch(batch_df, batch_id):
         conn.close()
         
         duration = (datetime.now() - batch_start).total_seconds()
-        logger.info(f"[AGG BATCH {batch_id}] ✓ Wrote {written_count} records in {duration:.2f}s")
+        logger.info(f"[AGG BATCH {batch_id}] Wrote {written_count} records in {duration:.2f}s")
     
     except Exception as e:
-        logger.error(f"[AGG BATCH {batch_id}] ✗ Failed: {e}")
+        logger.error(f"[AGG BATCH {batch_id}] Failed: {e}")
         logger.error(traceback.format_exc())
 
 
-def main():
-    logger.info("=" * 80)
-    logger.info("SIMPLIFIED Kafka Consumer Starting")
-    logger.info("=" * 80)
-    
-    spark = create_spark_session()
-    
-    # Load schema
-    avro_schema, source = load_avro_schema(
-        Config.SCHEMA_REGISTRY_URL, Config.TOPIC, LOCAL_SCHEMA_PATH
-    )
-    logger.info(f"✓ Loaded Avro schema from {source}")
-    schema_broadcast = spark.sparkContext.broadcast(avro_schema)
-    deserialize_udf = make_deserialize_udf(schema_broadcast)
-    
-    # Connect to Kafka
-    bootstrap_csv = ",".join(Config.KAFKA_BOOTSTRAP_SERVERS)
-    logger.info(f"Connecting to Kafka: {bootstrap_csv}")
-    
-    df = (
-        spark.readStream
-        .format("kafka")
-        .option("kafka.bootstrap.servers", bootstrap_csv)
-        .option("subscribe", Config.TOPIC)
-        .option("startingOffsets", "earliest")
-        .option("kafka.session.timeout.ms", "30000")
-        .option("kafka.request.timeout.ms", "40000")
-        .option("kafka.max.poll.interval.ms", "300000")
-        .option("failOnDataLoss", "false")
-        .load()
-    )
-    logger.info("✓ Kafka stream connected")
-    
-    # ========== STREAM 1: EVENTS ==========
-    logger.info("Starting Stream 1: Events Processing")
-    
-    events_query = (
+def query_exception(query):
+    if query is None:
+        return None
+
+    try:
+        return query.exception()
+    except Exception as exc:
+        logger.warning(f"Could not read exception for query {query.id}: {exc}")
+        return None
+
+
+def log_query_failure(stream_name, query):
+    if query is None:
+        return
+
+    failure = query_exception(query)
+    if failure:
+        logger.error(f"{stream_name} stream failed (query_id={query.id}): {failure}")
+    else:
+        logger.info(f"{stream_name} stream status: active={query.isActive}, query_id={query.id}")
+
+
+def stop_query(stream_name, query):
+    if query is None:
+        return
+
+    try:
+        if query.isActive:
+            logger.info(f"Stopping {stream_name} stream...")
+            query.stop()
+    except Exception as exc:
+        logger.warning(f"Failed to stop {stream_name} stream cleanly: {exc}")
+
+
+def start_events_stream(df, deserialize_udf):
+    query = (
         df.writeStream
+        .queryName("ad_events_ingestion")
         .foreachBatch(lambda batch_df, epoch_id: process_events_batch(batch_df, epoch_id, deserialize_udf))
         .outputMode("append")
         .option("checkpointLocation", CHECKPOINT_PATH)
         .start()
     )
-    
-    logger.info(f"✓ Events stream started (query_id={events_query.id})")
-    
-    # ========== STREAM 2: WINDOWED AGGREGATION ==========
-    logger.info("Starting Stream 2: Windowed Aggregation")
-    
+
+    logger.info(f"Events stream started (query_id={query.id})")
+    return query
+
+
+def start_aggregation_stream(df, deserialize_udf):
+    agg_df = (
+        df.select(deserialize_udf(col("value")).alias("json_str"))
+        .withColumn("data", from_json(col("json_str"), OUTPUT_SCHEMA))
+        .select("data.*")
+        .filter(col("event_time").isNotNull())
+    )
+
+    windowed_df = (
+        agg_df
+        .select(
+            col("event_time"),
+            col("event_type"),
+            col("device"),
+            to_timestamp(col("event_time")).alias("event_timestamp")
+        )
+        .withWatermark("event_timestamp", "2 minutes")
+    )
+
+    aggregated_df = (
+        windowed_df
+        .groupBy(
+            window(col("event_timestamp"), "5 minutes"),
+            col("event_type"),
+            col("device")
+        )
+        .agg(count(col("event_timestamp")).alias("event_count"))
+        .select(
+            col("window").getField("start").alias("window_start"),
+            col("window").getField("end").alias("window_end"),
+            col("event_type"),
+            col("device"),
+            col("event_count")
+        )
+    )
+
+    aggregation_query = (
+        aggregated_df.writeStream
+        .queryName("ad_event_type_device_aggregation")
+        .foreachBatch(lambda batch_df, batch_id: write_aggregation_batch(batch_df, batch_id))
+        .outputMode("update")
+        .option("checkpointLocation", AGGREGATION_CHECKPOINT)
+        .start()
+    )
+
+    logger.info(f"Aggregation stream started (query_id={aggregation_query.id})")
+    return aggregation_query
+
+
+def run_consumer():
+    logger.info("=" * 80)
+    logger.info("SIMPLIFIED Kafka Consumer Starting")
+    logger.info("=" * 80)
+
+    spark = None
+    events_query = None
+    aggregation_query = None
+
     try:
-        # Parse events for aggregation - MUST use deserialize_udf like Stream 1!
-        agg_df = (
-            df.select(deserialize_udf(col("value")).alias("json_str"))
-            .withColumn("data", from_json(col("json_str"), OUTPUT_SCHEMA))
-            .select("data.*")
-            .filter(col("event_time").isNotNull())
+        spark = create_spark_session()
+
+        avro_schema, source = load_avro_schema(
+            Config.SCHEMA_REGISTRY_URL, Config.TOPIC, LOCAL_SCHEMA_PATH
         )
-        
-        # Create windows + watermark
-        windowed_df = (
-            agg_df
-            .select(
-                col("event_time"),
-                col("event_type"),
-                col("device"),
-                to_timestamp(col("event_time")).alias("event_timestamp")
-            )
-            .withWatermark("event_timestamp", "2 minutes")  # 2 min grace period
+        logger.info(f"Loaded Avro schema from {source}")
+        schema_broadcast = spark.sparkContext.broadcast(avro_schema)
+        deserialize_udf = make_deserialize_udf(schema_broadcast)
+
+        bootstrap_csv = ",".join(Config.KAFKA_BOOTSTRAP_SERVERS)
+        logger.info(f"Connecting to Kafka: {bootstrap_csv}")
+
+        df = (
+            spark.readStream
+            .format("kafka")
+            .option("kafka.bootstrap.servers", bootstrap_csv)
+            .option("subscribe", Config.TOPIC)
+            .option("startingOffsets", "earliest")
+            .option("kafka.session.timeout.ms", "30000")
+            .option("kafka.request.timeout.ms", "40000")
+            .option("kafka.max.poll.interval.ms", "300000")
+            .option("failOnDataLoss", "false")
+            .load()
         )
-        
-        # Aggregate by 5-min windows
-        aggregated_df = (
-            windowed_df
-            .groupBy(
-                window(col("event_timestamp"), "5 minutes"),
-                col("event_type"),
-                col("device")
-            )
-            .agg(count(col("event_timestamp")).alias("event_count"))
-            .select(
-                col("window").getField("start").alias("window_start"),
-                col("window").getField("end").alias("window_end"),
-                col("event_type"),
-                col("device"),
-                col("event_count")
-            )
-        )
-        
-        # Start aggregation stream
-        aggregation_query = (
-            aggregated_df.writeStream
-            .foreachBatch(lambda batch_df, batch_id: write_aggregation_batch(batch_df, batch_id))
-            .outputMode("update")
-            .option("checkpointLocation", AGGREGATION_CHECKPOINT)
-            .start()
-        )
-        
-        logger.info(f"✓ Aggregation stream started (query_id={aggregation_query.id})")
+        logger.info("Kafka stream connected")
+
+        events_query = start_events_stream(df, deserialize_udf)
+        aggregation_query = start_aggregation_stream(df, deserialize_udf)
+
         logger.info("=" * 80)
-        logger.info("✓ DUAL STREAMS ACTIVE:")
-        logger.info(f"  1. Events → PostgreSQL")
-        logger.info(f"  2. 5-min Aggregations → PostgreSQL")
+        logger.info("DUAL STREAMS ACTIVE:")
+        logger.info("  1. Events -> PostgreSQL")
+        logger.info("  2. 5-min Aggregations -> PostgreSQL")
         logger.info("=" * 80)
-        
-        events_query.awaitTermination()
-    
-    except Exception as e:
-        logger.error(f"✗ Aggregation stream failed: {e}")
-        logger.error(traceback.format_exc())
-        logger.info("Continuing with events-only stream...")
-        events_query.awaitTermination()
+
+        try:
+            spark.streams.awaitAnyTermination()
+        except Exception:
+            logger.error("One of the streaming queries terminated with an error.")
+            log_query_failure("Events", events_query)
+            log_query_failure("Aggregation", aggregation_query)
+
+            events_failed = query_exception(events_query) is not None
+            aggregation_failed = query_exception(aggregation_query) is not None
+
+            if aggregation_failed and not events_failed and events_query and events_query.isActive:
+                logger.info("Aggregation stream failed; continuing with events-only stream...")
+                spark.streams.resetTerminated()
+                events_query.awaitTermination()
+            else:
+                raise
+
+    finally:
+        stop_query("aggregation", aggregation_query)
+        stop_query("events", events_query)
+        if spark is not None:
+            try:
+                spark.stop()
+            except Exception as exc:
+                logger.warning(f"Failed to stop Spark session cleanly: {exc}")
+
 
 
 if __name__ == "__main__":
-    main()
-
+    run_consumer()
