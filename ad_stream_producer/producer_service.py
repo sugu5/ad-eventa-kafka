@@ -5,7 +5,6 @@ from .kafka_producer import AdKafkaProducer
 from .logger import get_logger
 from .schema import AdEvent
 from data_generator.event_generator import EventGenerator
-from metrics.metrics import events_per_second, producer_latency
 
 logger = get_logger("producer_service")
 
@@ -74,21 +73,18 @@ class ProducerService:
             # Serialize the event
             serialized_value = self.serialize_event(event)
             
-            # Record latency
-            with producer_latency.time():
-                # Send to Kafka
-                self.producer.send_event(
-                    topic=self.topic,
-                    key=key,
-                    value=serialized_value
-                )
-            
+            # Send to Kafka
+            self.producer.send_event(
+                topic=self.topic,
+                key=key,
+                value=serialized_value
+            )
+
             self.events_count += 1
             
             if self.events_count % 100 == 0:
                 elapsed = time.time() - self.start_time
                 current_rate = self.events_count / elapsed if elapsed > 0 else 0
-                events_per_second.set(current_rate)
                 logger.info(
                     f"Produced {self.events_count} events | "
                     f"Rate: {current_rate:.2f} events/sec | "

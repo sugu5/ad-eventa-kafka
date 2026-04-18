@@ -1,241 +1,523 @@
-# 🚀 Kafka Ad-Stream Pipeline
+# Kafka Ad Stream Consumer - Complete Setup Guide
 
-A **real-time ad-event streaming pipeline** built with Apache Kafka, Confluent Schema Registry, PySpark Structured Streaming, and PostgreSQL.
+## Quick Start
 
-Simulates an ad-tech data platform where millions of user interactions (views, clicks, purchases) are produced, validated, serialized with Avro, streamed through a 3-broker Kafka cluster, and consumed into a PostgreSQL data warehouse — all with end-to-end observability via Prometheus metrics.
-
----
-
-## 📐 Architecture
-
-```
-┌──────────────┐     Avro / Schema      ┌──────────────────┐
-│  Event       │     Registry            │  Schema Registry │
-│  Generator   │◄───────────────────────►│  (Confluent)     │
-│  (Faker)     │                         └──────────────────┘
-└──────┬───────┘                                  ▲
-       │ generate                                 │ register / fetch
-       ▼                                          │
-┌──────────────┐  produce   ┌─────────────────────┴───┐
-│  Producer    │───────────►│  Kafka Cluster (3 brokers)│
-│  Service     │  (Avro)    │  Topic: ads_events       │
-│  + Pydantic  │            │  Partitions: 3           │
-│    validation│            └─────────────┬────────────┘
-└──────────────┘                          │ consume
-       │                                  ▼
-  Prometheus              ┌───────────────────────────┐
-  metrics (:8001)         │  PySpark Structured        │
-                          │  Streaming Consumer        │
-                          │                            │
-                          │  ┌─────────┐ ┌───────────┐│
-                          │  │Good     │ │Corrupted  ││
-                          │  │Records  │ │Records    ││
-                          │  └────┬────┘ └─────┬─────┘│
-                          └───────┼────────────┼──────┘
-                                  │            │
-                                  ▼            ▼
-                          ┌────────────┐  ┌──────────┐
-                          │ PostgreSQL │  │  Local    │
-                          │ (JDBC)     │  │  JSON     │
-                          └────────────┘  └──────────┘
+```bash
+cd C:\Users\DELL 7380\Desktop\kafka-develop
+python -m consumer.simple_consumer
 ```
 
 ---
 
-## 🛠 Tech Stack
+## Project Overview
 
-| Component | Technology |
-|-----------|-----------|
-| Message Broker | Apache Kafka 7.6 (3-broker cluster) |
-| Schema Management | Confluent Schema Registry + Avro |
-| Producer | confluent-kafka Python client |
-| Data Validation | Pydantic v2 |
-| Consumer | PySpark Structured Streaming |
-| Sink | PostgreSQL 16 |
-| Observability | Prometheus (producer metrics) |
-| Data Generation | Faker |
-| Monitoring UI | Kafka UI (Provectus) |
-| Containerization | Docker Compose |
+**What it does:**
+- Reads ad events from Kafka
+- Parses Avro messages
+- Checks event lateness (2-hour threshold)
+- Writes on-time events → PostgreSQL
+- Writes late events → Parquet files
+- Computes 5-minute event aggregations (event_type + device counts)
+- Writes aggregations → PostgreSQL
+
+**Technology Stack:**
+- PySpark 3.5.0 (Structured Streaming)
+- Kafka (message broker)
+- PostgreSQL (data storage)
+- Python 3.11.9
 
 ---
 
-## 📂 Project Structure
+## Architecture
+
+### Dual Stream Processing
+
+```
+┌─────────────────┐
+│  Kafka Topic    │
+│  (ads_events)   │
+└────────┬────────┘
+         │
+         ├─────────────────────────┬──────────────────────────┐
+         │                         │                          │
+         ▼                         ▼                          ▼
+    ┌─────────────┐          ┌──────────────┐
+    │   STREAM 1  │          │  STREAM 2    │
+    │   EVENTS    │          │ AGGREGATION  │
+    └─────────────┘          └──────────────┘
+         │                         │
+    Deserialize              Parse → Watermark
+    Parse JSON               5-min Windows
+    Check Lateness           Group by event_type,device
+    Separate On-time/Late    Count events
+         │                         │
+         ├─ On-time (≤2h)         │
+         │  → PostgreSQL           │
+         │  (ad_events table)      │
+         │                         │
+         ├─ Late (>2h)            │
+         │  → Parquet             │
+         │                         │
+         ├─ Bad records           │
+         │  → JSON                │
+         │                         │
+         └─────────────────────────┴──────────────────────────┘
+                                  │
+                                  ▼
+                        ┌──────────────────┐
+                        │  PostgreSQL      │
+                        │  event_type_     │
+                        │  device_stats    │
+                        └──────────────────┘
+```
+
+---
+
+## PostgreSQL Tables
+
+### 1. event_schema.ad_events
+Stores all on-time events (≤ 2 hours lateness)
+
+```sql
+event_id (VARCHAR, PK)
+event_time (TIMESTAMP)
+user_id (VARCHAR)
+campaign_id (INT)
+ad_id (INT)
+device (VARCHAR)
+country (VARCHAR)
+event_type (VARCHAR)
+ad_creative_id (VARCHAR)
+```
+
+### 2. event_schema.event_type_device_stats
+Pre-computed 5-minute aggregations
+
+```sql
+event_type (VARCHAR)
+device (VARCHAR)
+event_count (INT)
+window_start (TIMESTAMP)
+window_end (TIMESTAMP)
+aggregation_time (TIMESTAMP)
+```
+
+---
+
+## File Structure
 
 ```
 kafka-develop/
-├── ad_stream_producer/          # Kafka producer package
-│   ├── config.py                # Env-var-driven configuration
-│   ├── kafka_producer.py        # Async confluent-kafka Producer wrapper
-│   ├── logger.py                # Structured logging
-│   ├── producer_service.py      # Orchestrates generate → validate → serialize → produce
-│   ├── run_producer.py          # CLI entry point
-│   └── schema.py                # Pydantic AdEvent model
-├── consumer/                    # Spark consumer package
-│   ├── avro_deserializer.py     # Avro deser UDF + Schema Registry client
-│   ├── sink.py                  # foreachBatch processor (Postgres + Parquet fallback)
-│   └── run_consumer.py          # CLI entry point
-├── data_generator/
-│   └── event_generator.py       # Realistic synthetic event generator
-├── metrics/
-│   └── metrics.py               # Prometheus counters, gauges, histograms
-├── schema/
-│   └── ad_event_update.avsc     # Avro schema definition
-├── tests/                       # pytest test suite
-│   ├── test_event_generator.py
+├── README.md                       ← Complete documentation
+├── docker-compose.yaml             ← Docker setup (Kafka, PostgreSQL)
+├── init_db.sql                     ← Database initialization
+├── log4j.properties                ← Spark logging config
+├── pyproject.toml                  ← Python dependencies
+├── .env.example                    ← Environment variables template
+│
+├── consumer/                       ← CONSUMER MODULE
+│   ├── simple_consumer.py          ← MAIN FILE (run this!)
+│   ├── avro_deserializer.py        ← Avro parsing utility
+│   └── __init__.py
+│
+├── ad_stream_producer/             ← PRODUCER MODULE
+│   ├── run_producer.py
+│   ├── config.py
+│   ├── kafka_producer.py
+│   ├── producer_service.py
+│   ├── logger.py
+│   ├── schema.py
+│   └── __init__.py
+│
+├── data_generator/                 ← EVENT GENERATOR
+│   ├── event_generator.py
+│   └── __init__.py
+│
+├── schema/                         ← AVRO SCHEMAS
+│   ├── ad_event_update.avsc
+│   └── __init__.py
+│
+├── tests/                          ← TEST SUITE
 │   ├── test_avro_serde.py
-│   └── test_producer_service.py
-├── docker-compose.yaml          # Full infra: Kafka × 3, ZK, SR, Kafka UI, Postgres
-├── init_db.sql                  # PostgreSQL table + indexes
-├── .env.example                 # Environment variable template
-├── pyproject.toml               # Python project config + dependencies
-└── README.md
+│   ├── test_event_generator.py
+│   ├── test_producer_service.py
+│   └── __init__.py
+│
+├── jars/                           ← DOWNLOADED JARS
+│   ├── kafka-clients-3.4.1.jar
+│   └── postgresql-42.6.0.jar
+│
+└── output/                         ← RUNTIME OUTPUT
+    ├── checkpoints_final_robust/   (events stream checkpoint)
+    ├── checkpoints_aggregation/    (aggregation stream checkpoint)
+    ├── late_events_parquet/        (late events data)
+    ├── corrupted_records/          (bad records)
+    └── consumer.log                (log file)
 ```
 
 ---
 
-## ⚡ Quick Start
+## Configuration
 
-### Prerequisites
-- Docker & Docker Compose
-- Python 3.9+
+All settings in `ad_stream_producer/config.py`:
 
-### 1. Start Infrastructure
+```python
+# Kafka
+KAFKA_BOOTSTRAP_SERVERS = ["localhost:9095", "localhost:9093", "localhost:9094"]
+TOPIC = "ads_events"
 
-```bash
-docker-compose up -d
-```
+# Schema Registry
+SCHEMA_REGISTRY_URL = "http://localhost:8081"
+SCHEMA_PATH = "ad_event_update.avsc"
 
-This brings up:
-- **Zookeeper** — cluster coordination
-- **Kafka × 3** — brokers on ports `9093`, `9094`, `9095`
-- **Schema Registry** — port `8081`
-- **Kafka UI** — port `8080` → [http://localhost:8080](http://localhost:8080)
-- **PostgreSQL** — port `5432` (auto-creates `event_schema.ad_events` table)
-
-### 2. Install Python Dependencies
-
-```bash
-pip install -e ".[dev]"
-```
-
-### 3. Configure Environment
-
-```bash
-cp .env.example .env
-# Edit .env if your ports / credentials differ
-```
-
-### 4. Run the Producer
-
-```bash
-python -m ad_stream_producer.run_producer
-```
-
-The producer will:
-- Generate synthetic ad events using Faker
-- Validate each event with Pydantic
-- Serialize with Avro (registered in Schema Registry)
-- Produce to `ads_events` topic at configurable rate (default: 10/sec)
-- Expose Prometheus metrics on `:8001`
-
-### 5. Run the Consumer
-
-```bash
-python -m consumer.run_consumer
-```
-
-The consumer will:
-- Read from `ads_events` topic using PySpark Structured Streaming
-- Deserialize Avro messages (Confluent wire format)
-- **Write valid records to PostgreSQL with UPSERT** (handles duplicates gracefully)
-- Route corrupted records to local JSON files
-
-### 6. Run Tests
-
-```bash
-pytest tests/ -v
+# PostgreSQL
+POSTGRES_URL = "jdbc:postgresql://localhost:5432/postgres"
+POSTGRES_USER = "postgres"
+POSTGRES_PASSWORD = "postgres"
+POSTGRES_TABLE = "event_schema.ad_events"
 ```
 
 ---
 
-## 📊 Event Schema
+## Stream 1: Events Processing
 
-```json
-{
-  "type": "record",
-  "name": "AdEvent",
-  "namespace": "ads",
-  "fields": [
-    {"name": "event_id",       "type": "string"},
-    {"name": "event_time",     "type": "string"},
-    {"name": "user_id",        "type": "string"},
-    {"name": "campaign_id",    "type": "int"},
-    {"name": "ad_id",          "type": "int"},
-    {"name": "device",         "type": "string"},
-    {"name": "country",        "type": "string"},
-    {"name": "event_type",     "type": "string"},
-    {"name": "ad_creative_id", "type": ["null", "string"]}
-  ]
-}
+**Function:** `process_events_batch(batch_df, epoch_id)`
+
+**Steps:**
+1. Deserialize Avro → JSON string
+2. Parse JSON using OUTPUT_SCHEMA
+3. Separate good/bad records
+4. Calculate lateness in seconds:
+   ```
+   lateness = current_time - event_time
+   ```
+5. Classify:
+   - On-time: lateness ≤ 7200 seconds (2 hours)
+   - Late: lateness > 7200 seconds
+6. Write to PostgreSQL (on-time):
+   - Create temp table via JDBC
+   - UPSERT into main table (ON CONFLICT)
+   - Drop temp table
+7. Write late events to Parquet
+8. Write corrupted records to JSON
+
+**Example Log:**
+```
+[BATCH 123] Processing 450 records
+[BATCH 123] On-time: 440, Late: 10, Bad: 0
+[BATCH 123] ✓ Wrote 440 on-time records to PostgreSQL
+[BATCH 123] ✓ Wrote 10 late records to Parquet
+[BATCH 123] ✓ Done in 2.34s
 ```
 
-Event types follow a realistic distribution: **views (55%) > clicks (33%) > purchases (11%)**
+---
+
+## Stream 2: Windowed Aggregation
+
+**Function:** `write_aggregation_batch(batch_df, batch_id)`
+
+**Processing:**
+1. Parse events (same as Stream 1)
+2. Convert `event_time` → timestamp
+3. Apply watermark: 2-minute grace period
+   - Allows late data to update existing windows
+4. Create 5-minute tumbling windows
+5. Group by: event_type + device
+6. Aggregate: count(events)
+7. Write to PostgreSQL:
+   - UPSERT based on (event_type, device, window_start, window_end)
+
+**Example Output:**
+```
+event_type | device  | event_count | window_start        | window_end
+-----------+---------+-------------+---------------------+--------------------
+view       | mobile  | 145         | 2026-04-18 14:00:00 | 2026-04-18 14:05:00
+view       | desktop | 89          | 2026-04-18 14:00:00 | 2026-04-18 14:05:00
+click      | mobile  | 23          | 2026-04-18 14:00:00 | 2026-04-18 14:05:00
+purchase   | tablet  | 5           | 2026-04-18 14:00:00 | 2026-04-18 14:05:00
+```
 
 ---
 
-## 🔑 Key Design Decisions
+## SQL Queries
 
-| Decision | Rationale |
-|----------|-----------|
-| **confluent-kafka** (not kafka-python) | Native C library — higher throughput, async produce with delivery callbacks |
-| **Avro + Schema Registry** | Compact binary format, centralized schema evolution, backward compatibility |
-| **Pydantic validation before serialization** | Catch malformed events at the producer, not the consumer |
-| **3-broker cluster with replication factor 3** | Fault-tolerant — survives 1 broker failure |
-| **PySpark Structured Streaming** | Exactly-once semantics with checkpointing, micro-batch processing |
-| **PostgreSQL with Parquet fallback** | If DB is down, data is preserved locally and not lost |
-| **Prometheus metrics** | Production-standard observability (events/sec, latency, failures) |
-| **Fixed user pool (1000 users)** | Simulates realistic session continuity vs. random UUIDs |
-| **Environment-variable config** | No secrets in source code, 12-factor app pattern |
-| **PostgreSQL UPSERT** | Handles duplicate events gracefully with `ON CONFLICT DO UPDATE` |
+### Get Latest Aggregations (Last 5 Minutes)
+```sql
+SELECT event_type, device, SUM(event_count) as total
+FROM event_schema.event_type_device_stats
+WHERE window_end >= NOW() - INTERVAL '5 minutes'
+GROUP BY event_type, device
+ORDER BY total DESC;
+```
+
+### Get Event Trend Over Time
+```sql
+SELECT 
+    window_end,
+    event_type,
+    device,
+    event_count
+FROM event_schema.event_type_device_stats
+WHERE window_end >= NOW() - INTERVAL '1 hour'
+ORDER BY window_end DESC, event_type, device;
+```
+
+### Get Device Distribution for 'view' Events
+```sql
+SELECT 
+    device,
+    SUM(event_count) as total,
+    ROUND(100.0 * SUM(event_count) / SUM(SUM(event_count)) OVER (), 2) as pct
+FROM event_schema.event_type_device_stats
+WHERE event_type = 'view' AND window_end >= NOW() - INTERVAL '10 minutes'
+GROUP BY device
+ORDER BY total DESC;
+```
+
+### Get Recent Events from PostgreSQL
+```sql
+SELECT event_id, event_type, device, event_time, campaign_id
+FROM event_schema.ad_events
+WHERE event_time >= NOW() - INTERVAL '1 hour'
+LIMIT 100;
+```
 
 ---
 
-## 📈 Monitoring
+## What simple_consumer.py Contains
 
-- **Kafka UI**: [http://localhost:8080](http://localhost:8080) — topics, partitions, consumer groups
-- **Prometheus metrics**: [http://localhost:8001](http://localhost:8001) — producer throughput, latency, failures
+### 1. Constants
+- Output paths (checkpoints, parquet dirs)
+- Event schema definition
+- Configuration paths
+
+### 2. create_spark_session()
+- Sets up Spark with Kafka + PostgreSQL support
+- Downloads JARs if needed
+- Configures logging
+- Returns SparkSession
+
+### 3. process_events_batch(batch_df, epoch_id)
+- Main event processing logic
+- ~150 lines
+- Handles all error cases
+
+### 4. write_aggregation_batch(batch_df, batch_id)
+- Writes aggregated stats to PostgreSQL
+- Creates schema/table if needed
+- Creates indexes
+- Performs UPSERT
+
+### 5. main()
+- Initializes Spark session
+- Loads Avro schema
+- Connects to Kafka
+- Starts Stream 1 (Events)
+- Starts Stream 2 (Aggregation)
+- Awaits termination
 
 ---
 
-## 🧪 Testing
+## Error Handling
+
+### PostgreSQL Connection Failures
+- Logs error with full traceback
+- Continues processing
+- Doesn't crash the entire consumer
+
+### Bad Records
+- Captured automatically
+- Saved to JSON files in corrupted_records/
+- Logged with count
+
+### Empty Batches
+- Skipped with warning log
+- No processing overhead
+
+### Aggregation Stream Failures
+- Caught and logged
+- Consumer continues with events-only stream
+- No data loss
+
+---
+
+## Monitoring
+
+### Expected Logs on Startup
+```
+================================================================================
+SIMPLIFIED Kafka Consumer Starting
+================================================================================
+✓ Spark 3.5.0 session created
+✓ Loaded Avro schema from http://localhost:8081
+✓ Kafka stream connected
+Starting Stream 1: Events Processing
+✓ Events stream started (query_id=...)
+Starting Stream 2: Windowed Aggregation
+✓ Aggregation stream started (query_id=...)
+================================================================================
+✓ DUAL STREAMS ACTIVE:
+  1. Events → PostgreSQL
+  2. 5-min Aggregations → PostgreSQL
+================================================================================
+```
+
+### During Execution
+```
+[BATCH 1] Processing 450 records
+[BATCH 1] On-time: 440, Late: 10, Bad: 0
+[BATCH 1] ✓ Wrote 440 on-time records to PostgreSQL
+[BATCH 1] ✓ Wrote 10 late records to Parquet
+[BATCH 1] ✓ Done in 2.34s
+[AGG BATCH 0] Processing 24 aggregation records
+[AGG BATCH 0] ✓ Wrote 24 records in 0.45s
+```
+
+---
+
+## Event Types & Devices
+
+From `data_generator/event_generator.py`:
+
+**Event Types (weighted):**
+- view (50% - most common)
+- click (30%)
+- purchase (20% - rarest)
+
+**Devices:**
+- mobile
+- desktop
+- tablet
+
+---
+
+## Lateness Logic
+
+```
+lateness_seconds = UNIX_TIMESTAMP(current_time) - UNIX_TIMESTAMP(event_time)
+
+if lateness_seconds <= 7200:  # 2 hours
+    → Write to PostgreSQL
+else:
+    → Write to Parquet (late events)
+```
+
+**Why 2 hours?**
+- Grace period for late-arriving events
+- Allows correction window
+- Beyond that, treated as historical data
+
+---
+
+## Watermark Explanation
+
+**Watermark: 2 minutes**
+- Events can arrive up to 2 minutes late
+- Spark will hold state for 2 minutes past window end
+- After 2 minutes, window is finalized
+- Late data arriving after watermark:
+  - Within 2 min grace → Updates existing window
+  - After 2 min grace → Dropped (state cleaned up)
+
+**Why 2 minutes?**
+- Network latency buffer
+- Allows corrections
+- Balances freshness vs accuracy
+
+---
+
+## Window Configuration
+
+**5-minute tumbling windows:**
+```
+14:00:00 - 14:05:00
+14:05:00 - 14:10:00
+14:10:00 - 14:15:00
+...
+```
+
+No overlap, back-to-back windows.
+
+---
+
+## Dependencies
+
+**Required packages:**
+```
+pyspark==3.5.0
+confluent-kafka[avro]
+fastavro
+psycopg2-binary
+python-dotenv
+```
+
+**Java:**
+- Apache Spark requires Java 8+
+- Kafka clients JAR downloaded automatically
+- PostgreSQL JDBC driver downloaded automatically
+
+---
+
+## Troubleshooting
+
+### "Port already in use" Error
+- Another Spark/Kafka process running
+- Kill it: `netstat -ano | findstr :9095`
+
+### "Connection refused to PostgreSQL"
+- PostgreSQL not running
+- Check: `psql -U postgres -h localhost`
+- Start: `pg_ctl -D /path/to/data start`
+
+### "No records being written"
+- Check Kafka has events
+- Verify schema matches
+- Check PostgreSQL is accessible
+- Review logs for errors
+
+### "Aggregation stream not starting"
+- Check PostgreSQL connection
+- Verify schema parsing works
+- Ensure event_time field exists
+
+---
+
+## Performance Notes
+
+- **Batch processing:** Micro-batches every 500ms (configurable)
+- **Latency:** Events to PostgreSQL within 1-2 seconds
+- **Throughput:** Depends on Kafka + PostgreSQL
+- **Memory:** Typical: 4GB heap (-Xmx4g)
+- **Checkpoint recovery:** ~30-60 seconds on restart
+
+---
+
+## Stopping the Consumer
 
 ```bash
-# Run all tests
-pytest tests/ -v
-
-# With coverage
-pytest tests/ --cov=ad_stream_producer --cov=data_generator -v
+Ctrl+C
 ```
 
-| Test File | What It Covers |
-|-----------|---------------|
-| `test_event_generator.py` | Event format, field ranges, distribution, user pool reuse, seed reproducibility |
-| `test_avro_serde.py` | Avro round-trip serialization, nullable fields, schema validation |
-| `test_producer_service.py` | Serialization calls, Kafka send, error handling, shutdown |
+Both streams will gracefully stop.
+Checkpoints saved for recovery.
 
 ---
 
-## 📝 What I Learned
+## Restarting from Last Position
 
-- How Kafka **partitioning** and **replication** work in a multi-broker setup
-- The **Confluent wire format** (magic byte + schema ID + Avro binary) and why Schema Registry exists
-- Why **subject naming strategies** (`topic_subject_name_strategy`) require `SerializationContext`
-- The difference between **sync vs. async producing** and the impact on throughput
-- PySpark **Structured Streaming checkpoints** for exactly-once delivery
-- Why **Pydantic validation at the producer** prevents downstream deserialization failures
+Run the same command:
+```bash
+python simple_consumer.py
+```
+
+Spark will resume from last checkpoint.
+No data loss between restarts.
 
 ---
 
-## License
+## That's It!
 
-Personal project — feel free to reference for learning.
+One file. Two streams. Real-time processing.
+
+Questions? Check the logs - they're detailed and descriptive.
+

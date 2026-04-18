@@ -7,7 +7,7 @@ from datetime import datetime
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from ad_stream_producer import ProducerService, metrics
+from ad_stream_producer import ProducerService
 from ad_stream_producer import Config
 from ad_stream_producer.logger import get_logger
 from confluent_kafka.schema_registry import SchemaRegistryClient
@@ -92,8 +92,6 @@ def main():
         logger.info("Initializing producer components...")
         avro_serializer = get_schema_registry_client()
 
-        logger.info("Starting metrics server...")
-        metrics.start_metrics_server()
 
         # Get configuration
         topic = Config.TOPIC

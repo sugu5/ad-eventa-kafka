@@ -1,7 +1,6 @@
 import traceback
 from confluent_kafka import Producer
 from .logger import get_logger
-from metrics.metrics import events_sent, events_failed
 
 logger = get_logger("producer")
 
@@ -34,12 +33,10 @@ class AdKafkaProducer:
     def _delivery_callback(err, msg):
         """Callback invoked once per message to indicate delivery result."""
         if err is not None:
-            events_failed.inc()
             logger.error(
                 f"Delivery failed for key '{msg.key()}': {err}"
             )
         else:
-            events_sent.inc()
             logger.debug(
                 f"Delivered key='{msg.key()}' to "
                 f"{msg.topic()}[{msg.partition()}] @offset {msg.offset()}"
@@ -69,7 +66,6 @@ class AdKafkaProducer:
                 callback=self._delivery_callback,
             )
         except Exception as e:
-            events_failed.inc()
             logger.error(f"Failed to produce event with key '{key}' to topic {topic}: {e}")
             logger.error(traceback.format_exc())
 
