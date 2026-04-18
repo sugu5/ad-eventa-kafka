@@ -37,7 +37,7 @@ CORRUPTED_RECORDS_PATH = str(PROJECT_ROOT / "output" / "corrupted_records")
 OUTPUT_PARQUET_PATH = str(PROJECT_ROOT / "output" / "ads_events_parquet")
 LATE_EVENTS_PATH = str(PROJECT_ROOT / "output" / "late_events_parquet")
 LOCAL_SCHEMA_PATH = PROJECT_ROOT / "schema" / Config.SCHEMA_PATH
-AGGREGATION_CHECKPOINT = str(PROJECT_ROOT / "output" / "checkpoints_aggregation")
+AGGREGATION_CHECKPOINT = str(PROJECT_ROOT / "output" / "checkpoints_aggregation_v2")
 
 # Event schema
 OUTPUT_SCHEMA = StructType([
