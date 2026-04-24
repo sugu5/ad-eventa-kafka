@@ -1,5 +1,5 @@
 """
-SIMPLIFIED Kafka -> PySpark Structured Streaming -> PostgreSQL Consumer
+Kafka -> PySpark Structured Streaming -> Iceberg Tables
 Single file - Events + Windowed Aggregation (5-min windows)
 
 Usage:
@@ -21,10 +21,9 @@ from consumer.avro_deserializer import load_avro_schema, make_deserialize_udf
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     col, from_json, to_timestamp, current_timestamp, unix_timestamp,
-    window, count
+    window, count, date_format
 )
 from pyspark.sql.types import StructType, StructField, StringType, IntegerType
-import psycopg2
 import pyspark
 import urllib.request
 import logging
@@ -34,8 +33,7 @@ logger = get_logger("simple_consumer")
 # Output paths
 CHECKPOINT_PATH = str(PROJECT_ROOT / "output" / "checkpoints_final_robust")
 CORRUPTED_RECORDS_PATH = str(PROJECT_ROOT / "output" / "corrupted_records")
-OUTPUT_PARQUET_PATH = str(PROJECT_ROOT / "output" / "ads_events_parquet")
-LATE_EVENTS_PATH = str(PROJECT_ROOT / "output" / "late_events_parquet")
+ICEBERG_WAREHOUSE = str(PROJECT_ROOT / "output" / "iceberg_warehouse")
 LOCAL_SCHEMA_PATH = PROJECT_ROOT / "schema" / Config.SCHEMA_PATH
 AGGREGATION_CHECKPOINT = str(PROJECT_ROOT / "output" / "checkpoints_aggregation_v2")
 
@@ -54,14 +52,14 @@ OUTPUT_SCHEMA = StructType([
 
 
 def create_spark_session():
-    """Create Spark session."""
+    """Create Spark session with Iceberg support."""
     logging.getLogger("org.apache.kafka").setLevel(logging.ERROR)
     logging.getLogger("kafka").setLevel(logging.ERROR)
     
     jars_dir = PROJECT_ROOT / "jars"
     jars_dir.mkdir(exist_ok=True)
     
-    # Download JARs if needed
+    # Download Kafka JAR if needed
     kafka_jar_path = jars_dir / "kafka-clients-3.4.1.jar"
     if not kafka_jar_path.exists():
         logger.info("Downloading kafka-clients JAR...")
@@ -73,33 +71,27 @@ def create_spark_session():
         except Exception as e:
             logger.warning(f"Failed to download: {e}")
     
-    pg_jar_path = jars_dir / "postgresql-42.6.0.jar"
-    if not pg_jar_path.exists():
-        logger.info("Downloading postgresql JAR...")
-        try:
-            urllib.request.urlretrieve(
-                "https://repo1.maven.org/maven2/org/postgresql/postgresql/42.6.0/postgresql-42.6.0.jar",
-                pg_jar_path
-            )
-        except Exception as e:
-            logger.warning(f"Failed to download: {e}")
-    
-    jars = f"{kafka_jar_path},{pg_jar_path}"
+    jars = str(kafka_jar_path)
     spark_version = pyspark.__version__
     
     spark = (
         SparkSession.builder
-        .appName("SimpleKafkaConsumer")
-        .config("spark.jars.packages", f"org.apache.spark:spark-sql-kafka-0-10_2.12:{spark_version}")
+        .appName("KafkaIcebergConsumer")
+        .config("spark.jars.packages", f"org.apache.spark:spark-sql-kafka-0-10_2.12:{spark_version},org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.4.2")
         .config("spark.jars", jars)
         .config("spark.driver.host", "127.0.0.1")
         .config("spark.streaming.kafka.consumer.cache.enabled", "false")
         .config("spark.sql.streaming.forceDeleteTempCheckpointLocation", "true")
+        .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
+        .config("spark.sql.catalog.local", "org.apache.iceberg.spark.SparkCatalog")
+        .config("spark.sql.catalog.local.type", "hadoop")
+        .config("spark.sql.catalog.local.warehouse", ICEBERG_WAREHOUSE)
+        .config("spark.sql.defaultCatalog", "local")
         .getOrCreate()
     )
     
     spark.sparkContext.setLogLevel("ERROR")
-    logger.info(f"Spark {spark.version} session created")
+    logger.info(f"Spark {spark.version} session created with Iceberg")
     return spark
 
 
@@ -164,7 +156,7 @@ def process_events_batch(batch_df, epoch_id, deserialize_udf):
             
             logger.info(f"[BATCH {epoch_id}] On-time: {on_time_count}, Late: {late_count}, Bad: {bad_count}")
             
-            # Write on-time to PostgreSQL
+            # Write on-time records to Iceberg table
             if on_time_count > 0:
                 try:
                     converted = (
@@ -172,58 +164,17 @@ def process_events_batch(batch_df, epoch_id, deserialize_udf):
                         .withColumn("event_time", to_timestamp(col("event_time")))
                         .withColumn("campaign_id", col("campaign_id").cast(IntegerType()))
                         .withColumn("ad_id", col("ad_id").cast(IntegerType()))
+                        .withColumn("event_date", date_format(col("event_time"), "yyyy-MM-dd"))
+                        .withColumn("ingestion_batch_id", col("event_id"))  # for ACID tracking
                     )
-                    
-                    temp_table = f"temp_ad_events_{epoch_id}_{int(batch_start.timestamp())}"
-                    
-                    converted.write.jdbc(
-                        url=Config.POSTGRES_URL,
-                        table=temp_table,
-                        mode="overwrite",
-                        properties=Config.POSTGRES_PROPERTIES,
-                    )
-                    
-                    # Upsert to main table
-                    conn = psycopg2.connect(
-                        host="localhost", port="5432", database="postgres",
-                        user=Config.POSTGRES_PROPERTIES["user"],
-                        password=Config.POSTGRES_PROPERTIES["password"]
-                    )
-                    conn.autocommit = True
-                    
-                    with conn.cursor() as cursor:
-                        upsert_sql = f"""
-                        INSERT INTO {Config.POSTGRES_TABLE} (
-                            event_id, event_time, user_id, campaign_id, ad_id,
-                            device, country, event_type, ad_creative_id
-                        )
-                        SELECT event_id, event_time, user_id, campaign_id, ad_id,
-                               device, country, event_type, ad_creative_id
-                        FROM {temp_table}
-                        ON CONFLICT (event_id) DO UPDATE SET
-                            event_time = EXCLUDED.event_time,
-                            user_id = EXCLUDED.user_id,
-                            campaign_id = EXCLUDED.campaign_id,
-                            ad_id = EXCLUDED.ad_id,
-                            device = EXCLUDED.device,
-                            country = EXCLUDED.country,
-                            event_type = EXCLUDED.event_type,
-                            ad_creative_id = EXCLUDED.ad_creative_id
-                        """
-                        cursor.execute(upsert_sql)
-                        rows = cursor.rowcount
-                    
-                    with conn.cursor() as cursor:
-                        cursor.execute(f"DROP TABLE IF EXISTS {temp_table}")
-                    conn.close()
-                    
-                    logger.info(f"[BATCH {epoch_id}] Wrote {rows} on-time records to PostgreSQL")
-                
+                    # Write to Iceberg table with snappy compression
+                    converted.coalesce(4).write.format("iceberg").mode("append").option("compression", "snappy").saveAsTable("ad_events")
+                    logger.info(f"[BATCH {epoch_id}] Wrote {on_time_count} on-time records to Iceberg table 'ad_events'")
                 except Exception as e:
-                    logger.error(f"[BATCH {epoch_id}] PostgreSQL failed: {e}")
+                    logger.error(f"[BATCH {epoch_id}] Writing to Iceberg 'ad_events' failed: {e}")
                     logger.error(traceback.format_exc())
             
-            # Write late to Parquet
+            # Write late to Iceberg table
             if late_count > 0:
                 try:
                     late_formatted = (
@@ -231,16 +182,20 @@ def process_events_batch(batch_df, epoch_id, deserialize_udf):
                         .withColumn("event_time", to_timestamp(col("event_time")))
                         .withColumn("campaign_id", col("campaign_id").cast(IntegerType()))
                         .withColumn("ad_id", col("ad_id").cast(IntegerType()))
+                        .withColumn("event_date", date_format(col("event_time"), "yyyy-MM-dd"))
                     )
-                    late_formatted.repartition(1).write.mode("append").parquet(LATE_EVENTS_PATH)
-                    logger.info(f"[BATCH {epoch_id}] Wrote {late_count} late records to Parquet")
+                    # Write late events to separate Iceberg table
+                    late_formatted.coalesce(2).write.format("iceberg").mode("append").option("compression", "snappy").saveAsTable("ad_events_late")
+                    logger.info(f"[BATCH {epoch_id}] Wrote {late_count} late records to Iceberg table 'ad_events_late'")
                 except Exception as e:
-                    logger.error(f"[BATCH {epoch_id}] Late events failed: {e}")
+                    logger.error(f"[BATCH {epoch_id}] Writing to Iceberg 'ad_events_late' failed: {e}")
+                    logger.error(traceback.format_exc())
         
         # Write bad records
         if bad_count > 0:
             try:
-                bad_records.repartition(1).write.mode("append").format("json").save(
+                # Minimal overhead for corrupted records
+                bad_records.coalesce(1).write.mode("append").format("json").save(
                     CORRUPTED_RECORDS_PATH
                 )
                 logger.info(f"[BATCH {epoch_id}] Wrote {bad_count} corrupted records")
@@ -256,11 +211,11 @@ def process_events_batch(batch_df, epoch_id, deserialize_udf):
 
 
 def write_aggregation_batch(batch_df, batch_id):
-    """Write aggregated statistics to PostgreSQL."""
+    """Write aggregated statistics to Iceberg table."""
     batch_start = datetime.now()
     
     try:
-        # Collect rows first - NO isEmpty() call!
+        # Collect rows first
         rows = batch_df.collect()
         
         if not rows:
@@ -270,70 +225,19 @@ def write_aggregation_batch(batch_df, batch_id):
         record_count = len(rows)
         logger.info(f"[AGG BATCH {batch_id}] Processing {record_count} aggregation records")
 
-        # ...existing code...
-
-        conn = psycopg2.connect(
-            host="localhost", port="5432", database="postgres",
-            user=Config.POSTGRES_PROPERTIES["user"],
-            password=Config.POSTGRES_PROPERTIES["password"]
-        )
-        conn.autocommit = True
+        # Add aggregation timestamp
+        agg_df = batch_df.withColumn("aggregation_time", current_timestamp())
         
-        with conn.cursor() as cursor:
-            # Create schema and table
-            cursor.execute("CREATE SCHEMA IF NOT EXISTS event_schema")
-            
-            create_table_sql = """
-            CREATE TABLE IF NOT EXISTS event_schema.event_type_device_stats (
-                id SERIAL PRIMARY KEY,
-                event_type VARCHAR(50),
-                device VARCHAR(50),
-                event_count INT,
-                window_start TIMESTAMP,
-                window_end TIMESTAMP,
-                aggregation_time TIMESTAMP,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(event_type, device, window_start, window_end)
-            )
-            """
-            cursor.execute(create_table_sql)
-            
-            # Create indexes
-            cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_window_time 
-            ON event_schema.event_type_device_stats(window_end DESC)
-            """)
-            cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_event_device 
-            ON event_schema.event_type_device_stats(event_type, device)
-            """)
-            
-            # Upsert records
-            written_count = 0
-            for row in rows:
-                event_type = row["event_type"]
-                device = row["device"]
-                event_count = row["event_count"]
-                window_start = row["window_start"]
-                window_end = row["window_end"]
-                aggregation_time = datetime.now()
-                
-                upsert_sql = """
-                INSERT INTO event_schema.event_type_device_stats 
-                (event_type, device, event_count, aggregation_time, window_start, window_end)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (event_type, device, window_start, window_end) DO UPDATE SET
-                    event_count = EXCLUDED.event_count,
-                    aggregation_time = EXCLUDED.aggregation_time
-                """
-                cursor.execute(upsert_sql, (event_type, device, event_count, 
-                                           aggregation_time, window_start, window_end))
-                written_count += 1
-        
-        conn.close()
+        # Write to Iceberg aggregations table
+        try:
+            agg_df.coalesce(2).write.format("iceberg").mode("append").option("compression", "snappy").saveAsTable("ad_events_aggregation")
+            logger.info(f"[AGG BATCH {batch_id}] Wrote {record_count} aggregation records to Iceberg table 'ad_events_aggregation'")
+        except Exception as e:
+            logger.error(f"[AGG BATCH {batch_id}] Writing to Iceberg failed: {e}")
+            logger.error(traceback.format_exc())
         
         duration = (datetime.now() - batch_start).total_seconds()
-        logger.info(f"[AGG BATCH {batch_id}] Wrote {written_count} records in {duration:.2f}s")
+        logger.info(f"[AGG BATCH {batch_id}] Done in {duration:.2f}s")
     
     except Exception as e:
         logger.error(f"[AGG BATCH {batch_id}] Failed: {e}")
@@ -478,8 +382,9 @@ def run_consumer():
 
         logger.info("=" * 80)
         logger.info("DUAL STREAMS ACTIVE:")
-        logger.info("  1. Events -> PostgreSQL")
-        logger.info("  2. 5-min Aggregations -> PostgreSQL")
+        logger.info("  1. Events (On-Time) -> Iceberg table 'ad_events'")
+        logger.info("  2. Events (Late) -> Iceberg table 'ad_events_late'")
+        logger.info("  3. 5-min Aggregations -> Iceberg table 'ad_events_aggregation'")
         logger.info("=" * 80)
 
         try:

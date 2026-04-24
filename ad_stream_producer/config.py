@@ -22,14 +22,9 @@ class Config:
     SCHEMA_REGISTRY_URL: str = os.getenv("SCHEMA_REGISTRY_URL", "http://localhost:8081")
     SCHEMA_PATH: str = os.getenv("SCHEMA_PATH", "ad_event_update.avsc")
 
-    # PostgreSQL
-    POSTGRES_URL: str = os.getenv("POSTGRES_URL", "jdbc:postgresql://localhost:5432/postgres")
-    POSTGRES_PROPERTIES: Dict[str, str] = {
-        "user": os.getenv("POSTGRES_USER", "postgres"),
-        "password": os.getenv("POSTGRES_PASSWORD", "postgres"),
-        "driver": os.getenv("POSTGRES_DRIVER", "org.postgresql.Driver"),
-    }
-    POSTGRES_TABLE: str = os.getenv("POSTGRES_TABLE", "event_schema.ad_events")
+    # Iceberg warehouse path
+    ICEBERG_WAREHOUSE: str = os.getenv("ICEBERG_WAREHOUSE", "output/iceberg_warehouse")
+    ICEBERG_CATALOG: str = os.getenv("ICEBERG_CATALOG", "local")
 
     # Producer
     PRODUCER_RATE_PER_SEC: int = int(os.getenv("PRODUCER_RATE_PER_SEC", "10"))
