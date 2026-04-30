@@ -63,17 +63,18 @@ class ProducerService:
             # Generate event
             event = self.event_generator.generate_event()
 
-            # Validate event against Pydantic schema
+            # Validate and convert to dict. Use mode="json" because the 
+            # current Avro schema expects event_time as a string.
             validated = AdEvent(**event)
-            event = validated.model_dump(mode="json")
+            event_data = validated.model_dump(mode="json")
             
-            # Create a key based on user_id for partitioning
-            key = event.get("user_id", str(self.events_count))
+            # Use user_id as partition key to ensure order for the same user
+            key = event_data.get("user_id", str(self.events_count))
             
             # Serialize the event
-            serialized_value = self.serialize_event(event)
+            serialized_value = self.serialize_event(event_data)
             
-            # Send to Kafka
+            # Send to Kafka (librdkafka handles batching in the background)
             self.producer.send_event(
                 topic=self.topic,
                 key=key,

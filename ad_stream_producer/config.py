@@ -49,5 +49,5 @@ class Config:
     ICEBERG_CATALOG: str = os.getenv("ICEBERG_CATALOG", "local")
 
     # Producer
-    PRODUCER_RATE_PER_SEC: int = int(os.getenv("PRODUCER_RATE_PER_SEC", "10"))
+    PRODUCER_RATE_PER_SEC: int = int(os.getenv("PRODUCER_RATE_PER_SEC", "20"))
     METRICS_PORT: int = int(os.getenv("METRICS_PORT", "8001"))

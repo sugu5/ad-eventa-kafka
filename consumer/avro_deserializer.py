@@ -2,7 +2,9 @@
 Avro deserialization helpers for the Spark consumer.
 """
 import json
+import traceback
 from typing import Optional
+from ad_stream_producer.logger import get_logger
 
 
 def get_avro_schema_from_registry(schema_registry_url: str, subject: str) -> Optional[str]:
@@ -20,6 +22,8 @@ def get_avro_schema_from_registry(schema_registry_url: str, subject: str) -> Opt
         return None
     except requests.RequestException:
         return None
+
+logger = get_logger("avro_deserializer")
 
 
 def load_avro_schema(schema_registry_url: str, topic: str, local_schema_path):
@@ -62,9 +66,7 @@ def make_deserialize_udf(schema_broadcast):
             record = fastavro.schemaless_reader(BytesIO(data[5:]), schema)
             return _json.dumps(record, default=str)
         except Exception as e:
-            print(f"Deserialization error: {e}")
+            logger.error(f"Deserialization error: {e}", exc_info=True)
             return None
 
     return udf(_deserialize, StringType())
-
-
