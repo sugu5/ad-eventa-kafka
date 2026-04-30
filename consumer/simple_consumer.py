@@ -23,7 +23,7 @@ from pyspark.sql.functions import (
     col, from_json, to_timestamp, current_timestamp, unix_timestamp,
     window, count, date_format
 )
-from pyspark.sql.types import StructType, StructField, StringType, IntegerType
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType, FloatType, DoubleType
 import pyspark
 import urllib.request
 import logging
@@ -37,7 +37,9 @@ ICEBERG_WAREHOUSE = str(PROJECT_ROOT / "output" / "iceberg_warehouse")
 LOCAL_SCHEMA_PATH = PROJECT_ROOT / "schema" / Config.SCHEMA_PATH
 AGGREGATION_CHECKPOINT = str(PROJECT_ROOT / "output" / "checkpoints_aggregation_v2")
 
-# Event schema
+# Event schema - v3 (BACKWARD COMPATIBLE)
+# Includes v3 fields: user_segment, conversion_value, geo_latitude
+# v1 and v2 data (without v3 fields) can still be read as v3 (null defaults)
 OUTPUT_SCHEMA = StructType([
     StructField("event_id", StringType(), True),
     StructField("event_time", StringType(), True),
@@ -48,6 +50,10 @@ OUTPUT_SCHEMA = StructType([
     StructField("country", StringType(), True),
     StructField("event_type", StringType(), True),
     StructField("ad_creative_id", StringType(), True),
+    StructField("engagement_score", FloatType(), True),  # v2
+    StructField("user_segment", StringType(), True),      # v3 NEW
+    StructField("conversion_value", DoubleType(), True),  # v3 NEW
+    StructField("geo_latitude", DoubleType(), True),      # v3 NEW
 ])
 
 
@@ -141,14 +147,16 @@ def process_events_batch(batch_df, epoch_id, deserialize_udf):
                 records_with_time
                 .where(col("lateness_seconds") <= 7200)
                 .select("event_id", "event_time", "user_id", "campaign_id", "ad_id",
-                        "device", "country", "event_type", "ad_creative_id")
+                        "device", "country", "event_type", "ad_creative_id", "engagement_score",
+                        "user_segment", "conversion_value", "geo_latitude")
             )
             
             late_records = (
                 records_with_time
                 .where(col("lateness_seconds") > 7200)
                 .select("event_id", "event_time", "user_id", "campaign_id", "ad_id",
-                        "device", "country", "event_type", "ad_creative_id")
+                        "device", "country", "event_type", "ad_creative_id", "engagement_score",
+                        "user_segment", "conversion_value", "geo_latitude")
             )
             
             on_time_count = on_time_records.count()

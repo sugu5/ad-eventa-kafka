@@ -1,0 +1,17 @@
+{
+  "type": "record",
+  "name": "AdEvent",
+  "namespace": "ads",
+  "doc": "Ad event schema v1 - Original schema (DEPRECATED - Use v2)",
+  "fields": [
+    {"name": "event_id", "type": "string", "doc": "Unique event identifier"},
+    {"name": "event_time", "type": "string", "doc": "Event timestamp in ISO8601 format"},
+    {"name": "user_id", "type": "string", "doc": "User identifier"},
+    {"name": "campaign_id", "type": "int", "doc": "Campaign identifier"},
+    {"name": "ad_id", "type": "int", "doc": "Ad identifier"},
+    {"name": "device", "type": "string", "doc": "Device type (mobile/desktop/tablet)"},
+    {"name": "country", "type": "string", "doc": "Country code (ISO 3166-1 alpha-2)"},
+    {"name": "event_type", "type": "string", "doc": "Event type (view/click/purchase)"},
+    {"name": "ad_creative_id", "type": ["null", "string"], "default": null, "doc": "Optional creative asset ID"}
+  ]
+}

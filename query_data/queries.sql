@@ -1,4 +1,4 @@
 SELECT
    *
-FROM ad_events_aggregation
+FROM ad_events_late
 LIMIT 100;
