@@ -53,6 +53,7 @@ WATERMARK_DELAY = "2 hours"
 DASHBOARD_WINDOW = "30 seconds"
 DASHBOARD_TRIGGER = "30 seconds"
 SHUFFLE_PARTITIONS = "8"
+MAX_OFFSETS_PER_TRIGGER = "2000"
 CLICK_EVENT_TYPES = ("click",)
 CONVERSION_EVENT_TYPES = ("purchase",)
 
@@ -143,6 +144,9 @@ def create_spark_session():
             ),
         )
         .config("spark.jars", jars)
+        .config("spark.driver.memory", "4g")
+        .config("spark.python.worker.reuse", "true")
+        .config("spark.sql.execution.python.processor.window.size", "2000")
         .config("spark.driver.host", "127.0.0.1")
         .config("spark.streaming.kafka.consumer.cache.enabled", "false")
         .config("spark.sql.streaming.forceDeleteTempCheckpointLocation", "true")
@@ -239,9 +243,30 @@ def ensure_iceberg_tables(spark):
     for table_name in ("ad_events", "ad_events_late", "campaign_conversion_metrics"):
         spark.sql(f"ALTER TABLE {table_name} SET TBLPROPERTIES ('format-version'='2')")
 
+    # Schema evolution: Ensure all columns required for v3 exist in the raw events tables.
+    # This prevents AnalysisExceptions if the tables were created with older schema versions.
+    column_definitions = {
+        "engagement_score": "FLOAT",
+        "user_segment": "STRING",
+        "conversion_value": "DOUBLE",
+        "geo_latitude": "DOUBLE",
+        "event_timestamp": "TIMESTAMP",
+        "ingestion_batch_id": "BIGINT",
+        "ingested_at": "TIMESTAMP"
+    }
+    for table_name in ("ad_events", "ad_events_late"):
+        spark.catalog.refreshTable(table_name)
+        existing_cols = [f.name for f in spark.table(table_name).schema.fields]
+        for col_name, col_type in column_definitions.items():
+            if col_name not in existing_cols:
+                logger.info(f"Evolving schema: adding {col_name} to {table_name}")
+                spark.sql(f"ALTER TABLE {table_name} ADD COLUMNS ({col_name} {col_type})")
+        spark.catalog.refreshTable(table_name)
+
 
 def align_to_target_columns(spark, source_df: DataFrame, table_name, all_columns):
     """Ensure the merge source has every target column, filling missing optional columns with nulls."""
+    spark.catalog.refreshTable(table_name)
     target_schema = {field.name: field.dataType for field in spark.table(table_name).schema.fields}
 
     aligned_df = source_df
@@ -256,10 +281,11 @@ def merge_into_iceberg_table(spark, source_df, table_name, key_columns, all_colu
     """Merge a microbatch into an Iceberg table using primary business keys."""
     aligned_source_df = align_to_target_columns(spark, source_df, table_name, all_columns)
 
-    if aligned_source_df.isEmpty():
-        return
-
     aligned_source_df.createOrReplaceTempView(temp_view_name)
+
+    # Force a cache clear for the target table to prevent AnalysisExceptions 
+    # when processing high-volume batches after a schema change.
+    spark.catalog.refreshTable(table_name)
 
     merge_condition = " AND ".join([f"target.{column} = source.{column}" for column in key_columns])
     update_clause = ", ".join([f"{column} = source.{column}" for column in all_columns])
@@ -367,6 +393,9 @@ def process_events_batch(batch_df, epoch_id, deserialize_udf):
         deserialized = batch_df.select(deserialize_udf(col("value")).alias("json_str"))
         parsed = deserialized.withColumn("data", from_json(col("json_str"), OUTPUT_SCHEMA))
 
+        # CRITICAL: Persist the parsed dataframe so the UDF runs only once.
+        parsed.persist()
+
         valid_records = (
             parsed.where("data is not null")
             .select("data.*")
@@ -467,6 +496,9 @@ def process_events_batch(batch_df, epoch_id, deserialize_udf):
             except Exception as exc:
                 logger.error(f"[BATCH {epoch_id}] Corrupted records failed: {exc}")
                 logger.error(traceback.format_exc())
+        
+        # Free memory at the end of the batch
+        parsed.unpersist()
 
         duration = (datetime.now() - batch_start).total_seconds()
         logger.info(f"[BATCH {epoch_id}] Done in {duration:.2f}s")
@@ -552,13 +584,16 @@ def run_consumer():
             .option("kafka.bootstrap.servers", bootstrap_csv)
             .option("subscribe", Config.TOPIC)
             .option("startingOffsets", "earliest")
+            .option("maxOffsetsPerTrigger", MAX_OFFSETS_PER_TRIGGER)
             .option("kafka.session.timeout.ms", "30000")
             .option("kafka.request.timeout.ms", "40000")
             .option("kafka.max.poll.interval.ms", "300000")
             .option("failOnDataLoss", "false")
             .load()
         )
-        logger.info("Kafka stream connected")
+        logger.info(
+            f"Kafka stream connected (trigger={DASHBOARD_TRIGGER}, maxOffsetsPerTrigger={MAX_OFFSETS_PER_TRIGGER})"
+        )
 
         events_query = start_events_stream(kafka_df, deserialize_udf)
 
