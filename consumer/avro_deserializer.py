@@ -2,7 +2,7 @@
 Avro deserialization helpers for the Spark consumer.
 """
 import json
-import traceback
+import threading
 from typing import Optional
 from ad_stream_producer.logger import get_logger
 
@@ -25,6 +25,11 @@ def get_avro_schema_from_registry(schema_registry_url: str, subject: str) -> Opt
 
 logger = get_logger("avro_deserializer")
 
+_schema_cache = {}
+_schema_cache_lock = threading.Lock()
+_error_counts = {}
+_MAX_LOGS_PER_ERROR_KEY = 5
+
 
 def load_avro_schema(schema_registry_url: str, topic: str, local_schema_path):
     """
@@ -41,7 +46,51 @@ def load_avro_schema(schema_registry_url: str, topic: str, local_schema_path):
         return json.load(f), "local"
 
 
-def make_deserialize_udf(schema_broadcast):
+def get_avro_schema_by_id(schema_registry_url: str, schema_id: int):
+    """
+    Fetch a schema by numeric schema ID from Schema Registry and cache it.
+    Returns parsed schema dict or None on failure.
+    """
+    import requests
+    import fastavro
+
+    with _schema_cache_lock:
+        cached = _schema_cache.get(schema_id)
+    if cached is not None:
+        return cached
+
+    url = f"{schema_registry_url}/schemas/ids/{schema_id}"
+    try:
+        response = requests.get(url, timeout=10)
+        if response.status_code != 200:
+            return None
+
+        schema_str = response.json().get("schema")
+        if not schema_str:
+            return None
+
+        parsed_schema = fastavro.parse_schema(json.loads(schema_str))
+        with _schema_cache_lock:
+            _schema_cache[schema_id] = parsed_schema
+        return parsed_schema
+    except requests.RequestException:
+        return None
+
+
+def _log_deserialization_error(error_key: str, message: str):
+    """
+    Avoid flooding stdout with identical tracebacks for malformed messages.
+    """
+    count = _error_counts.get(error_key, 0) + 1
+    _error_counts[error_key] = count
+
+    if count <= _MAX_LOGS_PER_ERROR_KEY:
+        logger.warning(message)
+    elif count == _MAX_LOGS_PER_ERROR_KEY + 1:
+        logger.warning(f"Further deserialization errors for '{error_key}' will be suppressed")
+
+
+def make_deserialize_udf(schema_registry_url: str, fallback_schema_broadcast):
     """
     Return a PySpark UDF that deserializes Confluent-wire-format Avro bytes
     into a JSON string.
@@ -62,11 +111,27 @@ def make_deserialize_udf(schema_broadcast):
             from io import BytesIO
             import json as _json
 
-            schema = schema_broadcast.value
+            if data[0] != 0:
+                _log_deserialization_error(
+                    "invalid_magic_byte",
+                    f"Skipping message with invalid Confluent magic byte: {data[0]}",
+                )
+                return None
+
+            schema_id = int.from_bytes(data[1:5], byteorder="big", signed=False)
+            schema = get_avro_schema_by_id(schema_registry_url, schema_id)
+            if schema is None:
+                schema = fallback_schema_broadcast.value
+
             record = fastavro.schemaless_reader(BytesIO(data[5:]), schema)
             return _json.dumps(record, default=str)
         except Exception as e:
-            logger.error(f"Deserialization error: {e}", exc_info=True)
+            error_key = type(e).__name__
+            payload_length = len(data) if data is not None else 0
+            _log_deserialization_error(
+                error_key,
+                f"Deserialization error ({error_key}) for payload length={payload_length}",
+            )
             return None
 
     return udf(_deserialize, StringType())

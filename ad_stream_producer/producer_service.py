@@ -1,9 +1,9 @@
 import time
 import traceback
 from confluent_kafka.serialization import SerializationContext, MessageField
-from .kafka_producer import AdKafkaProducer
-from .logger import get_logger
-from .schema import AdEvent
+from ad_stream_producer.kafka_producer import AdKafkaProducer
+from ad_stream_producer.logger import get_logger
+from ad_stream_producer.schema import AdEvent
 from data_generator.event_generator import EventGenerator
 
 logger = get_logger("producer_service")
@@ -37,6 +37,7 @@ class ProducerService:
     def serialize_event(self, event):
         """
         Serialize an event using the Avro serializer.
+        Includes retry logic for transient Schema Registry communication errors.
 
         Args:
             event (dict): The event to serialize
@@ -44,16 +45,22 @@ class ProducerService:
         Returns:
             bytes: Serialized event data
         """
-        try:
-            serialized = self.avro_serializer(
-                event, 
-                SerializationContext(self.topic, MessageField.VALUE)
-            )
-            return serialized
-        except Exception as e:
-            logger.error(f"Failed to serialize event: {e}")
-            logger.error(traceback.format_exc())
-            raise
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                return self.avro_serializer(
+                    event, 
+                    SerializationContext(self.topic, MessageField.VALUE)
+                )
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 0.5
+                    logger.warning(f"Serialization failed (attempt {attempt+1}/{max_retries}): {e}. Retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f"Failed to serialize event after {max_retries} attempts: {e}")
+                    logger.error(traceback.format_exc())
+                    raise
 
     def produce_event(self):
         """
