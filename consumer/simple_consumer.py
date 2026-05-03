@@ -21,12 +21,9 @@ from pyspark.sql.functions import (
     greatest,
     least,
     lit,
-    max as max_,
-    min as min_,
     sum as sum_,
     to_date,
     to_timestamp,
-    unix_timestamp,
     when,
     window,
 )
@@ -44,10 +41,9 @@ logger = get_logger("simple_consumer")
 
 # Output paths
 CHECKPOINT_PATH = str(PROJECT_ROOT / "output" / "checkpoints_final_robust")
-CORRUPTED_RECORDS_PATH = str(PROJECT_ROOT / "output" / "corrupted_records")
+METRICS_CHECKPOINT_PATH = str(PROJECT_ROOT / "output" / "checkpoints_campaign_conversion_watermarked")
 ICEBERG_WAREHOUSE = str(PROJECT_ROOT / "output" / "iceberg_warehouse")
 LOCAL_SCHEMA_PATH = PROJECT_ROOT / "schema" / Config.SCHEMA_PATH
-CONVERSION_METRICS_CHECKPOINT = str(PROJECT_ROOT / "output" / "checkpoints_campaign_conversion_v1")
 
 WATERMARK_DELAY = "2 hours"
 DASHBOARD_WINDOW = "30 seconds"
@@ -73,6 +69,21 @@ RAW_EVENT_COLUMNS = [
     "geo_latitude",
     "event_timestamp",
     "event_date",
+    "ingestion_batch_id",
+    "ingested_at",
+]
+
+RAW_KAFKA_EVENT_COLUMNS = [
+    "kafka_topic",
+    "kafka_partition",
+    "kafka_offset",
+    "kafka_timestamp",
+    "kafka_timestamp_type",
+    "key",
+    "value",
+    "deserialized_payload",
+    "parse_status",
+    "kafka_date",
     "ingestion_batch_id",
     "ingested_at",
 ]
@@ -168,34 +179,29 @@ def ensure_iceberg_tables(spark):
     """Create required Iceberg tables for raw events and dashboard metrics."""
     spark.sql(
         """
-        CREATE TABLE IF NOT EXISTS ad_events (
-            event_id STRING,
-            event_time TIMESTAMP,
-            user_id STRING,
-            campaign_id INT,
-            ad_id INT,
-            device STRING,
-            country STRING,
-            event_type STRING,
-            ad_creative_id STRING,
-            engagement_score FLOAT,
-            user_segment STRING,
-            conversion_value DOUBLE,
-            geo_latitude DOUBLE,
-            event_timestamp TIMESTAMP,
-            event_date DATE,
+        CREATE TABLE IF NOT EXISTS raw_ad_events (
+            kafka_topic STRING,
+            kafka_partition INT,
+            kafka_offset BIGINT,
+            kafka_timestamp TIMESTAMP,
+            kafka_timestamp_type INT,
+            key BINARY,
+            value BINARY,
+            deserialized_payload STRING,
+            parse_status STRING,
+            kafka_date DATE,
             ingestion_batch_id BIGINT,
             ingested_at TIMESTAMP
         )
         USING iceberg
-        PARTITIONED BY (event_date)
+        PARTITIONED BY (kafka_date)
         TBLPROPERTIES ('format-version'='2')
         """
     )
 
     spark.sql(
         """
-        CREATE TABLE IF NOT EXISTS ad_events_late (
+        CREATE TABLE IF NOT EXISTS ad_events (
             event_id STRING,
             event_time TIMESTAMP,
             user_id STRING,
@@ -240,7 +246,7 @@ def ensure_iceberg_tables(spark):
         """
     )
 
-    for table_name in ("ad_events", "ad_events_late", "campaign_conversion_metrics"):
+    for table_name in ("raw_ad_events", "ad_events", "campaign_conversion_metrics"):
         spark.sql(f"ALTER TABLE {table_name} SET TBLPROPERTIES ('format-version'='2')")
 
     # Schema evolution: Ensure all columns required for v3 exist in the raw events tables.
@@ -254,7 +260,7 @@ def ensure_iceberg_tables(spark):
         "ingestion_batch_id": "BIGINT",
         "ingested_at": "TIMESTAMP"
     }
-    for table_name in ("ad_events", "ad_events_late"):
+    for table_name in ("ad_events",):
         spark.catalog.refreshTable(table_name)
         existing_cols = [f.name for f in spark.table(table_name).schema.fields]
         for col_name, col_type in column_definitions.items():
@@ -287,10 +293,13 @@ def merge_into_iceberg_table(spark, source_df, table_name, key_columns, all_colu
     # when processing high-volume batches after a schema change.
     spark.catalog.refreshTable(table_name)
 
-    merge_condition = " AND ".join([f"target.{column} = source.{column}" for column in key_columns])
-    update_clause = ", ".join([f"{column} = source.{column}" for column in all_columns])
-    insert_columns = ", ".join(all_columns)
-    insert_values = ", ".join([f"source.{column}" for column in all_columns])
+    def quoted(column):
+        return f"`{column}`"
+
+    merge_condition = " AND ".join([f"target.{quoted(column)} = source.{quoted(column)}" for column in key_columns])
+    update_clause = ", ".join([f"{quoted(column)} = source.{quoted(column)}" for column in all_columns])
+    insert_columns = ", ".join([quoted(column) for column in all_columns])
+    insert_values = ", ".join([f"source.{quoted(column)}" for column in all_columns])
 
     spark.sql(
         f"""
@@ -303,6 +312,24 @@ def merge_into_iceberg_table(spark, source_df, table_name, key_columns, all_colu
     )
 
     spark.catalog.dropTempView(temp_view_name)
+
+
+def prepare_raw_kafka_records(parsed_df, epoch_id):
+    """Store every Kafka message before any business filtering."""
+    return (
+        parsed_df
+        .withColumn(
+            "parse_status",
+            when(col("json_str").isNull(), lit("deserialization_failed"))
+            .when(col("data").isNull(), lit("json_parse_failed"))
+            .when(col("data.event_id").isNull(), lit("missing_event_id"))
+            .otherwise(lit("parsed"))
+        )
+        .withColumn("kafka_date", to_date(col("kafka_timestamp")))
+        .withColumn("ingestion_batch_id", lit(int(epoch_id)))
+        .withColumn("ingested_at", current_timestamp())
+        .select(*RAW_KAFKA_EVENT_COLUMNS)
+    )
 
 
 def prepare_event_records(events_df, epoch_id):
@@ -320,8 +347,70 @@ def prepare_event_records(events_df, epoch_id):
     )
 
 
+def build_valid_events_stream(df, deserialize_udf):
+    """Parse Kafka records into valid event-time rows for downstream streaming logic."""
+    return (
+        df.select(deserialize_udf(col("value")).alias("json_str"))
+        .withColumn("data", from_json(col("json_str"), OUTPUT_SCHEMA))
+        .where("data is not null")
+        .select("data.*")
+        .withColumn("event_timestamp", to_timestamp(col("event_time")))
+        .filter(
+            col("event_id").isNotNull()
+            & col("campaign_id").isNotNull()
+            & col("event_type").isNotNull()
+            & col("event_timestamp").isNotNull()
+        )
+    )
+
+
+def build_watermarked_campaign_metrics_stream(df, deserialize_udf):
+    """Build real-time campaign metrics with an event-time watermark."""
+    valid_events = build_valid_events_stream(df, deserialize_udf)
+
+    metrics_source_df = (
+        valid_events.withWatermark("event_timestamp", WATERMARK_DELAY)
+        .where(col("event_type").isin(*(CLICK_EVENT_TYPES + CONVERSION_EVENT_TYPES)))
+        .select("event_timestamp", "campaign_id", "event_type")
+        .withColumn(
+            "is_click",
+            when(col("event_type").isin(*CLICK_EVENT_TYPES), lit(1)).otherwise(lit(0)),
+        )
+        .withColumn(
+            "is_conversion",
+            when(col("event_type").isin(*CONVERSION_EVENT_TYPES), lit(1)).otherwise(lit(0)),
+        )
+    )
+
+    return (
+        metrics_source_df.groupBy(window(col("event_timestamp"), DASHBOARD_WINDOW), col("campaign_id"))
+        .agg(
+            sum_("is_click").alias("clicks"),
+            sum_("is_conversion").alias("conversions"),
+        )
+        .select(
+            col("window").getField("start").alias("window_start"),
+            col("window").getField("end").alias("window_end"),
+            to_date(col("window").getField("start")).alias("window_date"),
+            col("campaign_id"),
+            col("clicks"),
+            col("conversions"),
+            least(col("clicks"), col("conversions")).alias("attributed_conversions"),
+            greatest(col("conversions") - col("clicks"), lit(0)).alias("orphan_conversions"),
+            when(
+                col("clicks") > 0,
+                least(col("clicks"), col("conversions")).cast("double") / col("clicks").cast("double"),
+            )
+            .otherwise(lit(0.0))
+            .cast("double")
+            .alias("conversion_rate"),
+            current_timestamp().alias("aggregation_time"),
+        )
+    )
+
+
 def recompute_campaign_conversion_metrics_for_range(spark, min_event_timestamp, max_event_timestamp):
-    """Recompute dashboard metrics from the authoritative raw Iceberg table for affected windows."""
+    """Recompute dashboard metrics from the curated events table for affected windows."""
     metrics_source_df = (
         spark.table("ad_events")
         .where(col("event_timestamp").between(lit(min_event_timestamp), lit(max_event_timestamp)))
@@ -377,8 +466,34 @@ def recompute_campaign_conversion_metrics_for_range(spark, min_event_timestamp, 
     return aggregated_df.count()
 
 
+def process_metrics_batch(batch_df, epoch_id):
+    """Merge watermarked streaming metric updates into Iceberg."""
+    spark = batch_df.sparkSession
+
+    if batch_df.isEmpty():
+        logger.info(f"[METRICS BATCH {epoch_id}] Empty batch")
+        return
+
+    try:
+        merge_into_iceberg_table(
+            spark,
+            batch_df,
+            "campaign_conversion_metrics",
+            ["campaign_id", "window_start", "window_end"],
+            CAMPAIGN_METRIC_COLUMNS,
+            f"campaign_conversion_metrics_stream_{epoch_id}",
+        )
+        logger.info(
+            f"[METRICS BATCH {epoch_id}] Upserted {batch_df.count()} watermarked campaign conversion windows"
+        )
+    except Exception as exc:
+        logger.error(f"[METRICS BATCH {epoch_id}] Writing campaign metrics failed: {exc}")
+        logger.error(traceback.format_exc())
+        raise
+
+
 def process_events_batch(batch_df, epoch_id, deserialize_udf):
-    """Process raw events, deduplicate by event_id, and write to Iceberg."""
+    """Store source records and curate valid events into Iceberg."""
     batch_start = datetime.now()
     spark = batch_df.sparkSession
 
@@ -390,11 +505,33 @@ def process_events_batch(batch_df, epoch_id, deserialize_udf):
     logger.info(f"[BATCH {epoch_id}] Processing {total} Kafka records")
 
     try:
-        deserialized = batch_df.select(deserialize_udf(col("value")).alias("json_str"))
-        parsed = deserialized.withColumn("data", from_json(col("json_str"), OUTPUT_SCHEMA))
+        kafka_records = batch_df.select(
+            col("topic").alias("kafka_topic"),
+            col("partition").alias("kafka_partition"),
+            col("offset").alias("kafka_offset"),
+            col("timestamp").alias("kafka_timestamp"),
+            col("timestampType").alias("kafka_timestamp_type"),
+            col("key"),
+            col("value"),
+            deserialize_udf(col("value")).alias("json_str"),
+        )
+        parsed = kafka_records.withColumn("data", from_json(col("json_str"), OUTPUT_SCHEMA))
 
-        # CRITICAL: Persist the parsed dataframe so the UDF runs only once.
         parsed.persist()
+
+        raw_records = prepare_raw_kafka_records(
+            parsed.withColumn("deserialized_payload", col("json_str")),
+            epoch_id,
+        )
+        merge_into_iceberg_table(
+            spark,
+            raw_records,
+            "raw_ad_events",
+            ["kafka_topic", "kafka_partition", "kafka_offset"],
+            RAW_KAFKA_EVENT_COLUMNS,
+            f"raw_ad_events_batch_{epoch_id}",
+        )
+        logger.info(f"[BATCH {epoch_id}] Upserted {total} source records into Iceberg table 'raw_ad_events'")
 
         valid_records = (
             parsed.where("data is not null")
@@ -408,95 +545,30 @@ def process_events_batch(batch_df, epoch_id, deserialize_udf):
             )
         )
 
-        bad_records = parsed.where("data is null OR data.event_id IS NULL").select(
-            col("json_str").alias("corrupted_payload")
-        )
-
         good_count = valid_records.count()
-        bad_count = bad_records.count()
+        bad_count = total - good_count
+
+        logger.info(f"[BATCH {epoch_id}] Total: {total}, Valid: {good_count}, Corrupted: {bad_count}")
 
         if good_count > 0:
-            records_with_time = (
-                valid_records.withColumn("current_time", current_timestamp()).withColumn(
-                    "lateness_seconds",
-                    unix_timestamp(col("current_time")) - unix_timestamp(col("event_timestamp")),
-                )
-            )
-
-            on_time_records = records_with_time.where(col("lateness_seconds") <= 7200)
-            late_records = records_with_time.where(col("lateness_seconds") > 7200)
-
-            on_time_count = on_time_records.count()
-            late_count = late_records.count()
-
-            logger.info(
-                f"[BATCH {epoch_id}] Valid: {good_count}, On-time: {on_time_count}, "
-                f"Late: {late_count}, Bad: {bad_count}"
-            )
-
-            if on_time_count > 0:
-                try:
-                    prepared_on_time = prepare_event_records(on_time_records, epoch_id)
-                    merge_into_iceberg_table(
-                        spark,
-                        prepared_on_time,
-                        "ad_events",
-                        ["event_id"],
-                        RAW_EVENT_COLUMNS,
-                        f"ad_events_batch_{epoch_id}",
-                    )
-                    logger.info(
-                        f"[BATCH {epoch_id}] Upserted {prepared_on_time.count()} on-time records into Iceberg table 'ad_events'"
-                    )
-
-                    affected_range = prepared_on_time.agg(
-                        min_("event_timestamp").alias("min_event_timestamp"),
-                        max_("event_timestamp").alias("max_event_timestamp"),
-                    ).collect()[0]
-                    min_event_timestamp = affected_range["min_event_timestamp"]
-                    max_event_timestamp = affected_range["max_event_timestamp"]
-
-                    if min_event_timestamp is not None and max_event_timestamp is not None:
-                        metrics_rows = recompute_campaign_conversion_metrics_for_range(
-                            spark,
-                            min_event_timestamp,
-                            max_event_timestamp,
-                        )
-                        logger.info(
-                            f"[BATCH {epoch_id}] Recomputed {metrics_rows} campaign conversion windows"
-                        )
-                except Exception as exc:
-                    logger.error(f"[BATCH {epoch_id}] Writing to Iceberg 'ad_events' failed: {exc}")
-                    logger.error(traceback.format_exc())
-                    raise
-
-            if late_count > 0:
-                try:
-                    prepared_late = prepare_event_records(late_records, epoch_id)
-                    merge_into_iceberg_table(
-                        spark,
-                        prepared_late,
-                        "ad_events_late",
-                        ["event_id"],
-                        RAW_EVENT_COLUMNS,
-                        f"ad_events_late_batch_{epoch_id}",
-                    )
-                    logger.info(
-                        f"[BATCH {epoch_id}] Upserted {prepared_late.count()} late records into Iceberg table 'ad_events_late'"
-                    )
-                except Exception as exc:
-                    logger.error(f"[BATCH {epoch_id}] Writing to Iceberg 'ad_events_late' failed: {exc}")
-                    logger.error(traceback.format_exc())
-                    raise
-
-        if bad_count > 0:
             try:
-                bad_records.coalesce(1).write.mode("append").format("json").save(CORRUPTED_RECORDS_PATH)
-                logger.info(f"[BATCH {epoch_id}] Wrote {bad_count} corrupted records")
+                prepared_records = prepare_event_records(valid_records, epoch_id)
+                merge_into_iceberg_table(
+                    spark,
+                    prepared_records,
+                    "ad_events",
+                    ["event_id"],
+                    RAW_EVENT_COLUMNS,
+                    f"ad_events_batch_{epoch_id}",
+                )
+                logger.info(
+                    f"[BATCH {epoch_id}] Upserted {prepared_records.count()} records into Iceberg table 'ad_events'"
+                )
             except Exception as exc:
-                logger.error(f"[BATCH {epoch_id}] Corrupted records failed: {exc}")
+                logger.error(f"[BATCH {epoch_id}] Writing to Iceberg 'ad_events' failed: {exc}")
                 logger.error(traceback.format_exc())
-        
+                raise
+
         # Free memory at the end of the batch
         parsed.unpersist()
 
@@ -557,6 +629,21 @@ def start_events_stream(df, deserialize_udf):
     return query
 
 
+def start_campaign_metrics_stream(df, deserialize_udf):
+    metrics_df = build_watermarked_campaign_metrics_stream(df, deserialize_udf)
+    query = (
+        metrics_df.writeStream.queryName("campaign_conversion_metrics_watermarked")
+        .foreachBatch(process_metrics_batch)
+        .outputMode("update")
+        .option("checkpointLocation", METRICS_CHECKPOINT_PATH)
+        .trigger(processingTime=DASHBOARD_TRIGGER)
+        .start()
+    )
+
+    logger.info(f"Campaign metrics stream started with watermark={WATERMARK_DELAY} (query_id={query.id})")
+    return query
+
+
 def run_consumer():
     logger.info("=" * 80)
     logger.info("SIMPLIFIED Kafka Consumer Starting")
@@ -564,6 +651,7 @@ def run_consumer():
 
     spark = None
     events_query = None
+    metrics_query = None
 
     try:
         spark = create_spark_session()
@@ -596,18 +684,20 @@ def run_consumer():
         )
 
         events_query = start_events_stream(kafka_df, deserialize_udf)
+        metrics_query = start_campaign_metrics_stream(kafka_df, deserialize_udf)
 
         logger.info("=" * 80)
         logger.info("PIPELINE ACTIVE:")
-        logger.info("  1. On-time raw events -> Iceberg table 'ad_events'")
-        logger.info("  2. Very late raw events -> Iceberg table 'ad_events_late'")
-        logger.info("  3. 30-sec campaign conversion metrics recomputed from 'ad_events' -> Iceberg table 'campaign_conversion_metrics'")
+        logger.info("  1. All Kafka source records -> Iceberg table 'raw_ad_events'")
+        logger.info("  2. Valid parsed events -> Iceberg table 'ad_events'")
+        logger.info(f"  3. Watermarked ({WATERMARK_DELAY}) 30-sec campaign metrics -> Iceberg table 'campaign_conversion_metrics'")
         logger.info("=" * 80)
 
-        events_query.awaitTermination()
+        spark.streams.awaitAnyTermination()
 
     finally:
         stop_query("events", events_query)
+        stop_query("campaign metrics", metrics_query)
         if spark is not None:
             try:
                 spark.stop()
